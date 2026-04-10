@@ -3,7 +3,7 @@ import AppKit
 import Foundation
 import OSLog
 import Observation
-import ClaudeCodeSDK
+@preconcurrency import ClaudeCodeSDK
 import SwiftAnthropic
 
 // MARK: - 调试日志
@@ -52,12 +52,6 @@ private func isSystemMessage(_ content: String) -> Bool {
     let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.hasPrefix("<") && trimmed.hasSuffix(">") { return true }
     return false
-}
-
-// MARK: - Combine/AsyncStream 桥接辅助（Swift 6 @unchecked Sendable）
-
-private final class CancellableBox: @unchecked Sendable {
-    nonisolated(unsafe) var value: AnyCancellable?
 }
 
 // MARK: - 应用全局状态
@@ -128,7 +122,7 @@ class AppState {
     func initializeClient() {
         do {
             var config = ClaudeCodeConfiguration.default
-            config.enableDebugLogging = false
+            config.enableDebugLogging = true   // 开启 SDK 级别 OSLog 诊断
             client = try ClaudeCodeClient(configuration: config)
             isClaudeInstalled = true
             addLog(.info, "ClaudeCodeClient 初始化成功")
@@ -270,13 +264,17 @@ class AppState {
                 var loaded: [AgentSession] = []
                 for s in stored.sorted(by: { $0.lastAccessedAt > $1.lastAccessedAt }).prefix(100) {
 
-                    // 过滤有效消息（去除系统消息）
-                    let validMessages = s.messages.filter { msg in
-                        !isSystemMessage(msg.content) && !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    // 清洗并过滤有效消息（先 cleanContent 再判空，避免因 caveat 误杀真实用户消息）
+                    // isSystemMessage 只用来过滤「纯系统消息」，不影响混合 caveat 的用户消息
+                    let cleanedMessages: [(msg: ClaudeStoredMessage, cleaned: String)] = s.messages.compactMap { msg in
+                        guard msg.role != .system else { return nil }
+                        let cleaned = cleanContent(msg.content)
+                        guard !cleaned.isEmpty else { return nil }
+                        return (msg, cleaned)
                     }
 
-                    // 如果会话完全没有有效消息，跳过
-                    if validMessages.isEmpty && s.summary == nil {
+                    // 如果会话没有任何有效消息且无摘要，跳过
+                    if cleanedMessages.isEmpty && s.summary == nil {
                         addLog(.debug, "跳过空会话 \(s.id.prefix(8))")
                         continue
                     }
@@ -285,34 +283,34 @@ class AppState {
                     let title: String
                     if let summary = s.summary, !summary.isEmpty {
                         title = String(summary.prefix(60))
-                    } else if let firstUserMsg = validMessages.first(where: { $0.role == .user }) {
-                        let cleaned = cleanContent(firstUserMsg.content)
-                        title = String(cleaned.prefix(50)).replacingOccurrences(of: "\n", with: " ")
+                    } else if let firstUser = cleanedMessages.first(where: { $0.msg.role == .user }) {
+                        title = String(firstUser.cleaned.prefix(50)).replacingOccurrences(of: "\n", with: " ")
                     } else {
                         title = "会话 \(s.id.prefix(8))"
                     }
 
-                    let subtitle = URL(fileURLWithPath: s.projectPath).lastPathComponent
+                    // 优先从 JSONL cwd 字段获取真实路径（SDK decode 会把 "." 误转成 "/"）
+                    let actualWorkDir = s.messages.first(where: { $0.cwd != nil })?.cwd ?? s.projectPath
+                    let subtitle = URL(fileURLWithPath: actualWorkDir).lastPathComponent
                     let timestamp = dateFormatter.string(from: s.lastAccessedAt)
 
                     var session = AgentSession(
                         title: title.isEmpty ? "会话 \(s.id.prefix(8))" : title,
                         subtitle: subtitle,
                         timestamp: timestamp,
-                        workingDirectory: s.projectPath
+                        workingDirectory: actualWorkDir
                     )
                     session.sdkSessionId = s.id
 
                     loaded.append(session)
 
-                    // 加载并清洗最近消息
-                    let recentMsgs = validMessages.suffix(30)
-                    messagesBySession[session.id] = recentMsgs.compactMap { msg in
-                        let cleaned = cleanContent(msg.content)
-                        guard !cleaned.isEmpty else { return nil }
-                        let role: MessageRole = msg.role == .user ? .user : .assistant
-                        return ChatMessage(role: role, blocks: [.text(cleaned)])
+                    // 加载最近 30 条有效消息
+                    let recentMsgs = cleanedMessages.suffix(30)
+                    messagesBySession[session.id] = recentMsgs.map { item in
+                        let role: MessageRole = item.msg.role == .user ? .user : .assistant
+                        return ChatMessage(role: role, blocks: [.text(item.cleaned)])
                     }
+                    addLog(.debug, "会话 \(s.id.prefix(8))：加载 \(recentMsgs.count) 条消息")
                 }
 
                 if !loaded.isEmpty {
@@ -435,88 +433,83 @@ class AppState {
 
             switch result {
             case .stream(let publisher):
-                // ResponseChunk 不是 Sendable，不能用 AsyncStream 桥接。
-                // 改用 withCheckedContinuation + sink(.receive(on:.main)) + MainActor.assumeIsolated
-                let box = CancellableBox()
-                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    var textBuffer = ""
-                    var toolBlocks: [ToolCallBlock] = []
-                    var capturedSid: String? = nil
+                // 使用 for await 在 @MainActor 上直接迭代，无需 Combine sink + MainActor.assumeIsolated
+                addLog(.info, "stream publisher 已获得，开始 for await 迭代...")
+                var textBuffer = ""
+                var toolBlocks: [ToolCallBlock] = []
+                var capturedSid: String? = nil
 
-                    box.value = publisher
-                        .receive(on: DispatchQueue.main)
-                        .sink(
-                            receiveCompletion: { _ in cont.resume() },
-                            receiveValue: { [weak self] chunk in
-                                guard let self = self else { return }
-                                // receive(on: .main) 保证在主线程，和 @MainActor 同线程
-                                MainActor.assumeIsolated {
-                                    switch chunk {
-                                    case .initSystem(let m):
-                                        capturedSid = m.sessionId
-                                        self.statusText = "已连接 · \(m.tools.count) 个工具"
-                                        if let idx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
-                                            self.sessions[idx].sdkSessionId = m.sessionId
-                                        }
-                                        self.addLog(.info, "已连接 sessionId=\(m.sessionId.prefix(8))，工具=\(m.tools.count)个")
+                do {
+                    for try await chunk in publisher.values {
+                        switch chunk {
+                        case .initSystem(let m):
+                            capturedSid = m.sessionId
+                            statusText = "已连接 · \(m.tools.count) 个工具"
+                            if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                                sessions[idx].sdkSessionId = m.sessionId
+                            }
+                            addLog(.info, "✅ initSystem: \(m.sessionId.prefix(8))，工具=\(m.tools.count)个")
 
-                                    case .assistant(let msg):
-                                        self.statusText = "助手正在回复..."
-                                        for content in msg.message.content {
-                                            switch content {
-                                            case .text(let text, _):
-                                                textBuffer = text
-                                                self.addLog(.debug, "text 长度=\(text.count)")
-                                            case .toolUse(let tool):
-                                                if !toolBlocks.contains(where: { $0.toolId == tool.id }) {
-                                                    let args = self.jsonDescription(tool.input)
-                                                    toolBlocks.append(ToolCallBlock(
-                                                        toolName: tool.name, args: args, toolId: tool.id))
-                                                    self.addLog(.debug, "工具调用：\(tool.name)")
-                                                }
-                                            default: break
-                                            }
-                                        }
-                                        var blocks: [MessageBlock] = []
-                                        if !textBuffer.isEmpty { blocks.append(.text(textBuffer)) }
-                                        for t in toolBlocks { blocks.append(.toolCall(t)) }
-                                        if blocks.isEmpty { blocks = [.text("")] }
-                                        self.updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: blocks)
-
-                                    case .user(let msg):
-                                        self.statusText = "工具执行中..."
-                                        for content in msg.message.content {
-                                            if case .toolResult(let result) = content,
-                                               let tid = result.toolUseId {
-                                                let rt: String
-                                                switch result.content {
-                                                case .string(let s): rt = s
-                                                case .items: rt = "(内容)"
-                                                }
-                                                self.updateToolResult(toolId: tid, result: rt, in: sessionId)
-                                            }
-                                        }
-
-                                    case .result(let m):
-                                        if let finalText = m.result, !finalText.isEmpty {
-                                            textBuffer = finalText
-                                        }
-                                        var blocks: [MessageBlock] = []
-                                        if !textBuffer.isEmpty { blocks.append(.text(textBuffer)) }
-                                        for t in toolBlocks { blocks.append(.toolCall(t)) }
-                                        if blocks.isEmpty { blocks = [.text("（操作完成）")] }
-                                        self.updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: blocks)
-                                        let cost = String(format: "%.4f", m.totalCostUsd)
-                                        if let idx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
-                                            self.sessions[idx].sdkSessionId = capturedSid ?? m.sessionId
-                                            self.sessions[idx].subtitle = "费用 $\(cost) · \(m.numTurns) 轮"
-                                            self.sessions[idx].timestamp = "刚刚"
-                                        }
-                                        self.addLog(.info, "完成：$\(m.totalCostUsd)，\(m.numTurns)轮，text=\(textBuffer.count)字")
+                        case .assistant(let msg):
+                            statusText = "助手正在回复..."
+                            addLog(.debug, "✅ assistant chunk，content=\(msg.message.content.count)项")
+                            for content in msg.message.content {
+                                switch content {
+                                case .text(let text, _):
+                                    textBuffer = text
+                                    addLog(.debug, "  → text \(text.count)字：[\(text.prefix(60))]")
+                                case .toolUse(let tool):
+                                    if !toolBlocks.contains(where: { $0.toolId == tool.id }) {
+                                        let args = jsonDescription(tool.input)
+                                        toolBlocks.append(ToolCallBlock(toolName: tool.name, args: args, toolId: tool.id))
+                                        addLog(.debug, "  → toolUse: \(tool.name)")
                                     }
+                                default: break
                                 }
                             }
-                        )
+                            var blocks: [MessageBlock] = []
+                            if !textBuffer.isEmpty { blocks.append(.text(textBuffer)) }
+                            for t in toolBlocks { blocks.append(.toolCall(t)) }
+                            if blocks.isEmpty { blocks = [.text("")] }
+                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: blocks)
+
+                        case .user(let msg):
+                            statusText = "工具执行中..."
+                            addLog(.debug, "✅ user chunk（工具结果）")
+                            for content in msg.message.content {
+                                if case .toolResult(let result) = content, let tid = result.toolUseId {
+                                    let rt: String
+                                    switch result.content {
+                                    case .string(let s): rt = s
+                                    case .items: rt = "(内容)"
+                                    }
+                                    updateToolResult(toolId: tid, result: rt, in: sessionId)
+                                }
+                            }
+
+                        case .result(let m):
+                            addLog(.info, "✅ result: cost=$\(m.totalCostUsd) turns=\(m.numTurns) text=\(m.result?.count ?? 0)字")
+                            if let finalText = m.result, !finalText.isEmpty {
+                                textBuffer = finalText
+                            }
+                            var blocks: [MessageBlock] = []
+                            if !textBuffer.isEmpty { blocks.append(.text(textBuffer)) }
+                            for t in toolBlocks { blocks.append(.toolCall(t)) }
+                            if blocks.isEmpty { blocks = [.text("（操作完成）")] }
+                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: blocks)
+                            let cost = String(format: "%.4f", m.totalCostUsd)
+                            if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                                sessions[idx].sdkSessionId = capturedSid ?? m.sessionId
+                                sessions[idx].subtitle = "费用 $\(cost) · \(m.numTurns) 轮"
+                                sessions[idx].timestamp = "刚刚"
+                            }
+                        }
+                    }
+                    addLog(.info, "stream 迭代完成")
+                } catch {
+                    addLog(.error, "stream 迭代出错：\(error)")
+                    errorMessage = "请求出错：\(error.localizedDescription)"
+                    removeMessage(assistantMsgId, from: sessionId)
                 }
 
             case .json(let msg):
@@ -645,31 +638,39 @@ class AppState {
     // MARK: 私有工具方法
 
     private func appendMessage(_ message: ChatMessage, to sessionId: UUID) {
-        if messagesBySession[sessionId] == nil {
-            messagesBySession[sessionId] = []
-        }
-        messagesBySession[sessionId]?.append(message)
+        var msgs = messagesBySession[sessionId] ?? []
+        msgs.append(message)
+        messagesBySession[sessionId] = msgs          // 显式赋值，确保 @Observable 触发
     }
 
     private func updateAssistantMessage(_ id: UUID, in sessionId: UUID, text: String) {
-        guard let idx = messagesBySession[sessionId]?.firstIndex(where: { $0.id == id }) else { return }
-        messagesBySession[sessionId]?[idx].blocks = [.text(text)]
+        guard var msgs = messagesBySession[sessionId],
+              let idx = msgs.firstIndex(where: { $0.id == id }) else { return }
+        msgs[idx].blocks = [.text(text)]
+        messagesBySession[sessionId] = msgs          // 显式赋值
     }
 
     private func updateAssistantBlocks(_ id: UUID, in sessionId: UUID, blocks: [MessageBlock]) {
-        guard let idx = messagesBySession[sessionId]?.firstIndex(where: { $0.id == id }) else { return }
-        messagesBySession[sessionId]?[idx].blocks = blocks
+        guard var msgs = messagesBySession[sessionId],
+              let idx = msgs.firstIndex(where: { $0.id == id }) else {
+            addLog(.error, "updateAssistantBlocks: 找不到消息 \(id) in \(sessionId)")
+            return
+        }
+        msgs[idx].blocks = blocks
+        messagesBySession[sessionId] = msgs          // 显式赋值
+        addLog(.debug, "updateAssistantBlocks: 更新完成，blocks=\(blocks.count)")
     }
 
     /// 更新指定工具调用的结果（在当前会话所有消息中查找）
     private func updateToolResult(toolId: String, result: String, in sessionId: UUID) {
-        guard let msgs = messagesBySession[sessionId] else { return }
+        guard var msgs = messagesBySession[sessionId] else { return }
         for (mi, msg) in msgs.enumerated() {
             for (bi, block) in msg.blocks.enumerated() {
                 if case .toolCall(let tc) = block, tc.toolId == toolId {
-                    messagesBySession[sessionId]?[mi].blocks[bi] =
+                    msgs[mi].blocks[bi] =
                         .toolCall(ToolCallBlock(toolName: tc.toolName, args: tc.args,
                                                result: result, toolId: toolId))
+                    messagesBySession[sessionId] = msgs  // 显式赋值
                     return
                 }
             }
@@ -699,7 +700,9 @@ class AppState {
     }
 
     private func removeMessage(_ id: UUID, from sessionId: UUID) {
-        messagesBySession[sessionId]?.removeAll { $0.id == id }
+        guard var msgs = messagesBySession[sessionId] else { return }
+        msgs.removeAll { $0.id == id }
+        messagesBySession[sessionId] = msgs          // 显式赋值
     }
 }
 

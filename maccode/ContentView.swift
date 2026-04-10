@@ -1185,12 +1185,19 @@ struct FilesPanel: View {
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if let dir = currentDir {
-                    Text(URL(fileURLWithPath: dir).lastPathComponent)
+                    let home = FileManager.default.homeDirectoryForCurrentUser.path
+                    let displayPath = dir.hasPrefix(home)
+                        ? "~" + dir.dropFirst(home.count)
+                        : dir
+                    Text(displayPath)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                         .padding(.horizontal, 6).padding(.vertical, 3)
                         .background(Color.white.opacity(0.06))
                         .cornerRadius(5)
+                        .help(dir)         // hover 显示完整路径
                 }
                 // 刷新按钮
                 if currentDir != nil {

@@ -10,7 +10,7 @@
 
 ## 截图
 
-> _(运行后截图放这里)_
+![maccode 主界面](screenshot.png)
 
 ---
 
