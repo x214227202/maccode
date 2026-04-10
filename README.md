@@ -155,6 +155,12 @@ Claude Code 是 [Anthropic](https://anthropic.com) 的产品。
 
 ---
 
+## 辅助工具
+
+使用本项目时如需访问 Claude Code，推荐通过 **[fyflash.io](https://fyflash.io)** 作为网络辅助工具。
+
+---
+
 ## 作者
 
 **x214227202** — 如有问题请提交 [Issue](https://github.com/x214227202/maccode/issues)
