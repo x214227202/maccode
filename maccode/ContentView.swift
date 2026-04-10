@@ -93,20 +93,27 @@ struct ContentView: View {
     }
 }
 
-// MARK: - 侧边栏（项目 + 对话两级）
+// MARK: - 侧边栏
+
+enum SidebarTab { case projects, sessions }
 
 struct SidebarView: View {
     @Environment(AppState.self) var appState
     @Binding var showDebugLog: Bool
-    @State private var sessionSearch = ""
+    @State private var activeTab: SidebarTab = .projects
+    @State private var search = ""
     @State private var showSettings = false
     @State private var refreshRotation: Double = 0
-    @State private var projectsExpanded = true
 
     var filteredSessions: [AgentSession] {
         let base = appState.currentProjectSessions
-        guard !sessionSearch.isEmpty else { return base }
-        return base.filter { $0.title.localizedCaseInsensitiveContains(sessionSearch) }
+        guard !search.isEmpty else { return base }
+        return base.filter { $0.title.localizedCaseInsensitiveContains(search) }
+    }
+
+    var filteredProjects: [Project] {
+        guard !search.isEmpty else { return appState.projects }
+        return appState.projects.filter { $0.name.localizedCaseInsensitiveContains(search) }
     }
 
     var body: some View {
@@ -114,45 +121,178 @@ struct SidebarView: View {
             // 红绿灯留白
             Spacer().frame(height: 36)
 
-            // ── 项目区域 ──────────────────────────────
-            HStack {
-                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { projectsExpanded.toggle() } }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: projectsExpanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundColor(.secondary.opacity(0.6))
-                        Text("项目")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(.secondary)
-                    }
-                }.buttonStyle(.plain)
+            // ── 胶囊切换按钮 ─────────────────────────
+            SidebarTabPicker(activeTab: $activeTab)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 10)
+
+            // ── 搜索框 ───────────────────────────────
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary.opacity(0.45))
+                TextField(activeTab == .projects ? "搜索项目..." : "搜索对话...", text: $search)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                if !search.isEmpty {
+                    Button(action: { search = "" }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.4))
+                    }.buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .background(Color.white.opacity(0.06))
+            .cornerRadius(7)
+            .padding(.horizontal, 10)
+            .padding(.bottom, 8)
+
+            Divider().opacity(0.15)
+
+            // ── 内용区（切换动画）────────────────────
+            Group {
+                if activeTab == .projects {
+                    ProjectsPanel(filteredProjects: filteredProjects)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .leading).combined(with: .opacity),
+                            removal:   .move(edge: .leading).combined(with: .opacity)
+                        ))
+                } else {
+                    SessionsPanel(filteredSessions: filteredSessions)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal:   .move(edge: .trailing).combined(with: .opacity)
+                        ))
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: activeTab)
+
+            Divider().opacity(0.15)
+
+            // ── 底部工具栏 ───────────────────────────
+            HStack(spacing: 14) {
+                Button(action: {
+                    withAnimation(.linear(duration: 0.5)) { refreshRotation += 360 }
+                    appState.loadExistingSessions()
+                }) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary.opacity(0.5))
+                        .rotationEffect(.degrees(refreshRotation))
+                }
+                .buttonStyle(.plain).help("刷新历史会话")
+
                 Spacer()
-                Button(action: { appState.addProject() }) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.secondary.opacity(0.7))
-                        .frame(width: 20, height: 20)
-                        .background(Color.white.opacity(0.06))
-                        .cornerRadius(4)
+
+                Button(action: { showDebugLog = true }) {
+                    Image(systemName: "ladybug")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary.opacity(0.5))
+                }
+                .buttonStyle(.plain).help("调试日志")
+
+                Button(action: { showSettings = true }) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary.opacity(0.5))
                 }
                 .buttonStyle(.plain)
-                .help("添加项目目录")
             }
-            .padding(.horizontal, 12).padding(.top, 6).padding(.bottom, 4)
+            .padding(.horizontal, 14).padding(.vertical, 9)
+            .sheet(isPresented: $showSettings) { SettingsView() }
+        }
+    }
+}
 
-            if projectsExpanded {
-                if appState.projects.isEmpty {
-                    HStack {
-                        Text("点击 + 添加项目目录")
+// MARK: - 胶囊切换组件
+
+struct SidebarTabPicker: View {
+    @Binding var activeTab: SidebarTab
+
+    var body: some View {
+        HStack(spacing: 0) {
+            tabButton(title: "项目", icon: "folder", tab: .projects)
+            tabButton(title: "Agent 对话", icon: "bubble.left.and.text.bubble.right", tab: .sessions)
+        }
+        .padding(3)
+        .background(Color.white.opacity(0.06))
+        .cornerRadius(9)
+    }
+
+    @ViewBuilder
+    func tabButton(title: String, icon: String, tab: SidebarTab) -> some View {
+        let isActive = activeTab == tab
+        Button(action: {
+            withAnimation(.easeInOut(duration: 0.18)) { activeTab = tab }
+        }) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: isActive ? .semibold : .regular))
+                Text(title)
+                    .font(.system(size: 12, weight: isActive ? .semibold : .regular))
+            }
+            .foregroundColor(isActive ? .white : .secondary.opacity(0.7))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(isActive ? Color.white.opacity(0.14) : Color.clear)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - 项目面板
+
+struct ProjectsPanel: View {
+    @Environment(AppState.self) var appState
+    let filteredProjects: [Project]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // 操作栏
+            HStack {
+                Text("项目")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button(action: { appState.addProject() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("添加")
                             .font(.system(size: 11))
-                            .foregroundColor(.secondary.opacity(0.45))
-                            .italic()
-                        Spacer()
                     }
-                    .padding(.horizontal, 14).padding(.vertical, 6)
-                } else {
-                    VStack(spacing: 1) {
-                        ForEach(appState.projects) { project in
+                    .foregroundColor(.blue.opacity(0.9))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Color.blue.opacity(0.12))
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
+
+            if filteredProjects.isEmpty {
+                Spacer()
+                VStack(spacing: 10) {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 30))
+                        .foregroundColor(.secondary.opacity(0.25))
+                    Text("添加项目目录")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary.opacity(0.5))
+                    Text("点击右上角「添加」\n选择本地项目文件夹")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary.opacity(0.35))
+                        .multilineTextAlignment(.center)
+                }
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 4) {
+                        ForEach(filteredProjects) { project in
                             ProjectRowView(
                                 project: project,
                                 isSelected: appState.selectedProjectId == project.id,
@@ -168,64 +308,70 @@ struct SidebarView: View {
                             }
                         }
                     }
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
                 }
             }
+        }
+    }
+}
 
-            Divider().opacity(0.2).padding(.top, 6)
+// MARK: - 对话面板
 
-            // ── 对话区域 ──────────────────────────────
+struct SessionsPanel: View {
+    @Environment(AppState.self) var appState
+    let filteredSessions: [AgentSession]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // 操作栏
             HStack {
-                Text(appState.selectedProject.map { "「\($0.name)」的对话" } ?? "对话")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
+                if let proj = appState.selectedProject {
+                    HStack(spacing: 5) {
+                        Image(systemName: "folder.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.blue.opacity(0.7))
+                        Text(proj.name)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                } else {
+                    Text("全部对话")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.secondary)
+                }
                 Spacer()
                 Button(action: { appState.newSession() }) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.secondary.opacity(0.7))
-                        .frame(width: 20, height: 20)
-                        .background(Color.white.opacity(0.06))
-                        .cornerRadius(4)
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("新建")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundColor(.blue.opacity(0.9))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Color.blue.opacity(0.12))
+                    .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
-                .help("新建对话")
             }
-            .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 4)
+            .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
 
-            // 搜索框
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 10)).foregroundColor(.secondary.opacity(0.5))
-                TextField("搜索对话...", text: $sessionSearch)
-                    .textFieldStyle(.plain).font(.system(size: 12))
-            }
-            .padding(.horizontal, 8).padding(.vertical, 4)
-            .background(Color.white.opacity(0.05)).cornerRadius(5)
-            .padding(.horizontal, 10).padding(.bottom, 6)
-
-            // 会话列表
             if filteredSessions.isEmpty {
+                Spacer()
                 VStack(spacing: 10) {
-                    Spacer()
                     Image(systemName: "bubble.left.and.bubble.right")
-                        .font(.system(size: 24))
-                        .foregroundColor(.secondary.opacity(0.3))
-                    if appState.selectedProject == nil {
-                        Text("先选择或添加项目")
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary.opacity(0.5))
-                    } else {
-                        Text("暂无对话")
-                            .font(.system(size: 12))
-                            .foregroundColor(.secondary.opacity(0.5))
-                        Text("点击上方 + 新建")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary.opacity(0.35))
-                    }
-                    Spacer()
+                        .font(.system(size: 30))
+                        .foregroundColor(.secondary.opacity(0.25))
+                    Text(appState.selectedProject == nil ? "请先选择项目" : "暂无对话")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary.opacity(0.5))
+                    Text(appState.selectedProject == nil ? "切换到「项目」标签\n选择或添加一个项目" : "点击右上角「新建」\n开始 Agent 对话")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary.opacity(0.35))
+                        .multilineTextAlignment(.center)
                 }
+                Spacer()
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
@@ -247,38 +393,6 @@ struct SidebarView: View {
                     .padding(.vertical, 4)
                 }
             }
-
-            Divider().opacity(0.2)
-
-            // 底部工具栏
-            HStack {
-                Button(action: {
-                    withAnimation(.linear(duration: 0.5)) { refreshRotation += 360 }
-                    appState.loadExistingSessions()
-                }) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary.opacity(0.55))
-                        .rotationEffect(.degrees(refreshRotation))
-                }
-                .buttonStyle(.plain)
-                .help("刷新历史会话")
-                Spacer()
-                Button(action: { showDebugLog = true }) {
-                    Image(systemName: "ladybug")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary.opacity(0.55))
-                }
-                .buttonStyle(.plain).help("调试日志")
-                Button(action: { showSettings = true }) {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary.opacity(0.55))
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .sheet(isPresented: $showSettings) { SettingsView() }
         }
     }
 }
@@ -291,39 +405,48 @@ struct ProjectRowView: View {
     let sessionCount: Int
 
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "folder.fill")
-                .font(.system(size: 11))
-                .foregroundColor(isSelected ? .blue.opacity(0.9) : .secondary.opacity(0.6))
-                .frame(width: 16)
+        HStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isSelected ? Color.blue.opacity(0.25) : Color.white.opacity(0.07))
+                    .frame(width: 30, height: 30)
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 13))
+                    .foregroundColor(isSelected ? .blue : .secondary.opacity(0.6))
+            }
 
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(project.name)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(isSelected ? .white : .primary.opacity(0.85))
                     .lineLimit(1)
                 Text(project.path)
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(.secondary.opacity(0.5))
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary.opacity(0.45))
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.head)
             }
 
             Spacer()
 
             if sessionCount > 0 {
                 Text("\(sessionCount)")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(isSelected ? .blue : .secondary.opacity(0.5))
-                    .padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(isSelected ? Color.blue.opacity(0.15) : Color.white.opacity(0.06))
-                    .cornerRadius(4)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(isSelected ? .white.opacity(0.8) : .secondary.opacity(0.5))
+                    .frame(minWidth: 18, minHeight: 18)
+                    .padding(.horizontal, 4)
+                    .background(isSelected ? Color.blue.opacity(0.5) : Color.white.opacity(0.08))
+                    .cornerRadius(5)
             }
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
-        .background(isSelected ? Color.blue.opacity(0.12) : Color.clear)
-        .cornerRadius(6)
+        .background(isSelected ? Color.blue.opacity(0.15) : Color.white.opacity(0.0))
+        .cornerRadius(8)
         .contentShape(Rectangle())
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(isSelected ? Color.blue.opacity(0.3) : Color.clear, lineWidth: 1)
+        )
     }
 }
 
