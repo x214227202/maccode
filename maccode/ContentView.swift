@@ -1164,12 +1164,15 @@ struct FilesPanel: View {
     let session: AgentSession?
     @State private var searchText = ""
     @State private var fileItems: [FileItem] = []
-    @State private var rootDir: String? = nil
+    @State private var isLoading = false
+    @State private var loadError: String? = nil
 
     var filteredItems: [FileItem] {
         guard !searchText.isEmpty else { return fileItems }
         return fileItems.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
+
+    var currentDir: String? { session?.workingDirectory }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1181,13 +1184,21 @@ struct FilesPanel: View {
                 Text("文件")
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
-                if let dir = session?.workingDirectory {
+                if let dir = currentDir {
                     Text(URL(fileURLWithPath: dir).lastPathComponent)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                         .padding(.horizontal, 6).padding(.vertical, 3)
                         .background(Color.white.opacity(0.06))
                         .cornerRadius(5)
+                }
+                // 刷新按钮
+                if currentDir != nil {
+                    Button(action: { if let d = currentDir { loadFiles(from: d) } }) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.5))
+                    }.buttonStyle(.plain)
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
@@ -1209,20 +1220,38 @@ struct FilesPanel: View {
 
             Divider().opacity(0.2)
 
-            if let dir = session?.workingDirectory {
-                if filteredItems.isEmpty && searchText.isEmpty {
-                    VStack(spacing: 8) {
+            if let dir = currentDir {
+                if isLoading {
+                    Spacer()
+                    ProgressView().scaleEffect(0.7)
+                    Spacer()
+                } else if let err = loadError {
+                    VStack(spacing: 6) {
                         Spacer()
-                        ProgressView().scaleEffect(0.7)
-                        Text("加载中...")
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 20))
+                            .foregroundColor(.orange.opacity(0.6))
+                        Text(err)
                             .font(.system(size: 11))
-                            .foregroundColor(.secondary.opacity(0.5))
+                            .foregroundColor(.secondary.opacity(0.6))
+                            .multilineTextAlignment(.center)
                         Spacer()
-                    }
-                } else if filteredItems.isEmpty {
+                    }.padding(.horizontal, 12)
+                } else if filteredItems.isEmpty && !searchText.isEmpty {
                     VStack {
                         Spacer()
                         Text("无匹配文件")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.4))
+                        Spacer()
+                    }
+                } else if fileItems.isEmpty {
+                    VStack(spacing: 6) {
+                        Spacer()
+                        Image(systemName: "doc.badge.ellipsis")
+                            .font(.system(size: 22))
+                            .foregroundColor(.secondary.opacity(0.25))
+                        Text("目录为空")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary.opacity(0.4))
                         Spacer()
@@ -1236,8 +1265,6 @@ struct FilesPanel: View {
                         }
                     }
                 }
-                // 加载文件列表
-                let _ = dir  // 触发重新计算
             } else {
                 VStack(spacing: 8) {
                     Spacer()
@@ -1251,33 +1278,54 @@ struct FilesPanel: View {
                 }
             }
         }
-        .onChange(of: session?.workingDirectory) { _, newDir in
+        .onChange(of: currentDir) { _, newDir in
+            fileItems = []
+            loadError = nil
             if let dir = newDir { loadFiles(from: dir) }
-            else { fileItems = [] }
         }
         .onAppear {
-            if let dir = session?.workingDirectory { loadFiles(from: dir) }
+            if let dir = currentDir { loadFiles(from: dir) }
         }
     }
 
     func loadFiles(from dir: String) {
-        rootDir = dir
-        let fm = FileManager.default
-        guard let items = try? fm.contentsOfDirectory(atPath: dir) else {
-            fileItems = []; return
+        isLoading = true
+        loadError = nil
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fm = FileManager.default
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else {
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.loadError = "路径不存在或不是目录"
+                }
+                return
+            }
+            do {
+                let names = try fm.contentsOfDirectory(atPath: dir)
+                let items = names
+                    .filter { !$0.hasPrefix(".") }
+                    .map { name -> FileItem in
+                        let path = (dir as NSString).appendingPathComponent(name)
+                        var d: ObjCBool = false
+                        fm.fileExists(atPath: path, isDirectory: &d)
+                        return FileItem(name: name, isDirectory: d.boolValue, path: path)
+                    }
+                    .sorted { a, b in
+                        if a.isDirectory != b.isDirectory { return a.isDirectory }
+                        return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+                    }
+                DispatchQueue.main.async {
+                    self.fileItems = items
+                    self.isLoading = false
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isLoading = false
+                    self.loadError = "读取失败：\(error.localizedDescription)"
+                }
+            }
         }
-        fileItems = items
-            .filter { !$0.hasPrefix(".") }
-            .map { name -> FileItem in
-                let path = (dir as NSString).appendingPathComponent(name)
-                var isDir: ObjCBool = false
-                fm.fileExists(atPath: path, isDirectory: &isDir)
-                return FileItem(name: name, isDirectory: isDir.boolValue, path: path)
-            }
-            .sorted { a, b in
-                if a.isDirectory != b.isDirectory { return a.isDirectory }
-                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
-            }
     }
 }
 
