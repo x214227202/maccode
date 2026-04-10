@@ -286,43 +286,87 @@ class AppState {
         appendMessage(ChatMessage(id: assistantMsgId, role: .assistant, blocks: [.text("")]), to: sessionId)
 
         do {
+            // 使用 .json 格式：等待完整结果，result.result 有值
+            // streamJson 格式下 result.result = null，内容在 .assistant chunk 里需要 SwiftAnthropic
             let result: ClaudeCodeResult
             if let sid = sdkSessionId {
                 addLog(.info, "恢复会话 \(sid.prefix(8))...")
                 result = try await client.resumeConversation(
                     sessionId: sid,
                     prompt: prompt,
-                    outputFormat: .streamJson,
+                    outputFormat: .json,
                     options: options
                 )
             } else {
                 addLog(.info, "新建对话，模型=\(settings.selectedModel)")
                 result = try await client.runSinglePrompt(
                     prompt: prompt,
-                    outputFormat: .streamJson,
+                    outputFormat: .json,
                     options: options
                 )
             }
 
-            if case .stream(let publisher) = result {
+            addLog(.debug, "收到结果类型：\(resultTypeName(result))")
+
+            switch result {
+            case .json(let msg):
+                let text = msg.result?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if text.isEmpty {
+                    // json 格式理论上有 result，若仍为空则退一步用 streamJson 重试
+                    addLog(.error, "json result 为空，isError=\(msg.isError)，subtype=\(msg.subtype)")
+                    updateAssistantMessage(assistantMsgId, in: sessionId,
+                                          text: "⚠️ 收到空响应（isError=\(msg.isError)，subtype=\(msg.subtype)）\n请打开调试日志查看详情。")
+                } else {
+                    updateAssistantMessage(assistantMsgId, in: sessionId, text: text)
+                }
+                // 更新会话信息
+                let sdkId = msg.sessionId
+                let cost = String(format: "%.4f", msg.totalCostUsd)
+                if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                    sessions[idx].sdkSessionId = sdkId
+                    sessions[idx].subtitle = "费用 $\(cost) · \(msg.numTurns) 轮"
+                    sessions[idx].timestamp = "刚刚"
+                }
+                addLog(.info, "完成：费用=$\(msg.totalCostUsd)，轮数=\(msg.numTurns)，耗时=\(msg.durationMs)ms，sessionId=\(sdkId.prefix(8))")
+
+            case .text(let text):
+                updateAssistantMessage(assistantMsgId, in: sessionId, text: text)
+                addLog(.info, "收到 text 响应，长度=\(text.count)")
+
+            case .stream(let publisher):
+                // 若 SDK 降级返回 stream，从 result chunk 取最终文本
+                addLog(.info, "收到 stream，等待 result chunk...")
+                var finalText: String? = nil
+                var capturedSessionId: String? = nil
                 let mainPub = publisher.receive(on: DispatchQueue.main)
                 do {
                     for try await chunk in mainPub.values {
                         if Task.isCancelled { break }
-                        processChunk(chunk, sessionId: sessionId, assistantMsgId: assistantMsgId)
+                        switch chunk {
+                        case .initSystem(let m):
+                            capturedSessionId = m.sessionId
+                            statusText = "已连接 · \(m.tools.count) 个工具"
+                            addLog(.info, "stream initSystem sessionId=\(m.sessionId.prefix(8))")
+                        case .result(let m):
+                            finalText = m.result
+                            let cost = String(format: "%.4f", m.totalCostUsd)
+                            if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                                sessions[idx].sdkSessionId = capturedSessionId ?? m.sessionId
+                                sessions[idx].subtitle = "费用 $\(cost) · \(m.numTurns) 轮"
+                                sessions[idx].timestamp = "刚刚"
+                            }
+                            addLog(.info, "stream result：费用=$\(m.totalCostUsd)，result=\(m.result?.prefix(50) ?? "nil")")
+                        case .assistant:
+                            statusText = "助手正在回复..."
+                        case .user:
+                            statusText = "工具执行中..."
+                        }
                     }
                 } catch {
-                    if !Task.isCancelled {
-                        addLog(.error, "流中断：\(error)")
-                        errorMessage = "流式响应中断：\(error.localizedDescription)"
-                    }
+                    addLog(.error, "stream 中断：\(error)")
                 }
-            } else if case .text(let text) = result {
-                updateAssistantMessage(assistantMsgId, in: sessionId, text: text)
-                addLog(.info, "收到文本响应，长度=\(text.count)")
-            } else if case .json(let msg) = result {
-                updateAssistantMessage(assistantMsgId, in: sessionId, text: msg.result ?? "（操作完成，无文本输出）")
-                addLog(.info, "收到 JSON 响应，费用=$\(msg.totalCostUsd)")
+                updateAssistantMessage(assistantMsgId, in: sessionId,
+                                       text: finalText ?? "（响应完成，无文本输出）")
             }
 
         } catch let error as ClaudeCodeError {
@@ -473,7 +517,15 @@ struct DebugLogEntry: Identifiable {
     }
 }
 
-// MARK: - 辅助扩展
+// MARK: - 辅助函数
+
+private func resultTypeName(_ result: ClaudeCodeResult) -> String {
+    switch result {
+    case .text:   return "text"
+    case .json:   return "json"
+    case .stream: return "stream"
+    }
+}
 
 private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }

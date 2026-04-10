@@ -537,10 +537,8 @@ struct ChatMessageView: View {
                                     .lineSpacing(3)
                                     .textSelection(.enabled)
                             } else {
-                                // 流式占位
-                                ProgressView()
-                                    .scaleEffect(0.6)
-                                    .frame(height: 20)
+                                // 等待响应占位（动态省略号）
+                                ThinkingIndicator()
                             }
                         case .toolCall(let tc):
                             ToolCallView(tool: tc)
