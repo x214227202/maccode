@@ -105,17 +105,6 @@ struct SidebarView: View {
     @State private var showSettings = false
     @State private var refreshRotation: Double = 0
 
-    var filteredSessions: [AgentSession] {
-        let base = appState.currentProjectSessions
-        guard !search.isEmpty else { return base }
-        return base.filter { $0.title.localizedCaseInsensitiveContains(search) }
-    }
-
-    var filteredProjects: [Project] {
-        guard !search.isEmpty else { return appState.projects }
-        return appState.projects.filter { $0.name.localizedCaseInsensitiveContains(search) }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             // 红绿灯留白
@@ -131,7 +120,7 @@ struct SidebarView: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary.opacity(0.45))
-                TextField(activeTab == .projects ? "搜索项目..." : "搜索对话...", text: $search)
+                TextField(activeTab == .projects ? "搜索项目..." : "搜索对话内容...", text: $search)
                     .textFieldStyle(.plain)
                     .font(.system(size: 12))
                 if !search.isEmpty {
@@ -146,27 +135,12 @@ struct SidebarView: View {
             .background(Color.white.opacity(0.06))
             .cornerRadius(7)
             .padding(.horizontal, 10)
-            .padding(.bottom, 8)
+            .padding(.bottom, 6)
 
             Divider().opacity(0.15)
 
-            // ── 内용区（切换动画）────────────────────
-            Group {
-                if activeTab == .projects {
-                    ProjectsPanel(filteredProjects: filteredProjects)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .leading).combined(with: .opacity),
-                            removal:   .move(edge: .leading).combined(with: .opacity)
-                        ))
-                } else {
-                    SessionsPanel(filteredSessions: filteredSessions)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .trailing).combined(with: .opacity),
-                            removal:   .move(edge: .trailing).combined(with: .opacity)
-                        ))
-                }
-            }
-            .animation(.easeInOut(duration: 0.2), value: activeTab)
+            // ── 统一项目树 ───────────────────────────
+            ProjectTreePanel(activeTab: activeTab, search: search)
 
             Divider().opacity(0.15)
 
@@ -213,7 +187,7 @@ struct SidebarTabPicker: View {
     var body: some View {
         HStack(spacing: 0) {
             tabButton(title: "项目", icon: "folder", tab: .projects)
-            tabButton(title: "Agent 对话", icon: "bubble.left.and.text.bubble.right", tab: .sessions)
+            tabButton(title: "对话", icon: "message", tab: .sessions)
         }
         .padding(3)
         .background(Color.white.opacity(0.06))
@@ -238,246 +212,293 @@ struct SidebarTabPicker: View {
             .background(
                 RoundedRectangle(cornerRadius: 7)
                     .fill(isActive ? Color.white.opacity(0.14) : Color.clear)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(isActive ? Color.white.opacity(0.18) : Color.clear, lineWidth: 1)
+                    )
             )
         }
         .buttonStyle(.plain)
     }
 }
 
-// MARK: - 项目面板
+// MARK: - 统一项目树（Accordion）
 
-struct ProjectsPanel: View {
+struct ProjectTreePanel: View {
     @Environment(AppState.self) var appState
-    let filteredProjects: [Project]
+    let activeTab: SidebarTab
+    let search: String
+
+    var displayedProjects: [Project] {
+        if search.isEmpty { return appState.projects }
+        if activeTab == .projects {
+            return appState.projects.filter { $0.name.localizedCaseInsensitiveContains(search) }
+        } else {
+            return appState.projects.filter { proj in
+                appState.sessions.filter { $0.workingDirectory == proj.path }
+                    .contains { $0.title.localizedCaseInsensitiveContains(search) }
+            }
+        }
+    }
+
+    func sessionsFor(_ project: Project) -> [AgentSession] {
+        let all = appState.sessions.filter { $0.workingDirectory == project.path }
+        if search.isEmpty || activeTab == .projects { return all }
+        return all.filter { $0.title.localizedCaseInsensitiveContains(search) }
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // 操作栏
-            HStack {
-                Text("项目")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.secondary)
+        if displayedProjects.isEmpty {
+            VStack(spacing: 12) {
                 Spacer()
-                Button(action: { appState.addProject() }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 10, weight: .semibold))
-                        Text("添加")
-                            .font(.system(size: 11))
-                    }
-                    .foregroundColor(.blue.opacity(0.9))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(Color.blue.opacity(0.12))
-                    .cornerRadius(6)
+                Image(systemName: search.isEmpty ? "folder.badge.plus" : "magnifyingglass")
+                    .font(.system(size: 28))
+                    .foregroundColor(.secondary.opacity(0.2))
+                Text(search.isEmpty ? "添加项目目录" : "无匹配结果")
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary.opacity(0.45))
+                if search.isEmpty {
+                    Button(action: { appState.addProject() }) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "plus").font(.system(size: 11, weight: .semibold))
+                            Text("添加项目").font(.system(size: 12))
+                        }
+                        .foregroundColor(.blue)
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                        .background(Color.blue.opacity(0.12))
+                        .cornerRadius(8)
+                    }.buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
+                Spacer()
             }
-            .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
+            .frame(maxWidth: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(displayedProjects) { project in
+                        let isExpanded = appState.selectedProjectId == project.id
+                        let projectSessions = sessionsFor(project)
 
-            if filteredProjects.isEmpty {
-                Spacer()
-                VStack(spacing: 10) {
-                    Image(systemName: "folder.badge.plus")
-                        .font(.system(size: 30))
-                        .foregroundColor(.secondary.opacity(0.25))
-                    Text("添加项目目录")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary.opacity(0.5))
-                    Text("点击右上角「添加」\n选择本地项目文件夹")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary.opacity(0.35))
-                        .multilineTextAlignment(.center)
-                }
-                Spacer()
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 4) {
-                        ForEach(filteredProjects) { project in
-                            ProjectRowView(
-                                project: project,
-                                isSelected: appState.selectedProjectId == project.id,
-                                sessionCount: appState.sessions.filter { $0.workingDirectory == project.path }.count
-                            )
-                            .onTapGesture { appState.selectProject(project) }
-                            .contextMenu {
-                                Button(role: .destructive) {
-                                    appState.removeProject(project)
-                                } label: {
-                                    Label("移除项目", systemImage: "trash")
+                        // ── 项目行 ────────────────────────────
+                        ProjectAccordionRow(
+                            project: project,
+                            isExpanded: isExpanded,
+                            sessionCount: appState.sessions.filter { $0.workingDirectory == project.path }.count
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                appState.selectProject(project)
+                            }
+                        }
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                appState.removeProject(project)
+                            } label: {
+                                Label("移除项目", systemImage: "trash")
+                            }
+                        }
+
+                        // ── 展开内容 ──────────────────────────
+                        if isExpanded {
+                            // 新建会话按钮
+                            Button(action: { appState.newSession() }) {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 11, weight: .semibold))
+                                    Text("新建会话")
+                                        .font(.system(size: 12, weight: .medium))
+                                    Spacer()
+                                }
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 14).padding(.vertical, 8)
+                                .background(Color.blue.opacity(0.75))
+                                .cornerRadius(8)
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                            }
+                            .buttonStyle(.plain)
+
+                            // 会话列表
+                            ForEach(projectSessions) { session in
+                                let isSelected = appState.selectedSessionId == session.id
+                                let msgCount = appState.messagesBySession[session.id]?.count ?? 0
+                                SessionAccordionRow(
+                                    session: session,
+                                    isSelected: isSelected,
+                                    msgCount: msgCount
+                                )
+                                .contentShape(Rectangle())
+                                .onTapGesture { appState.selectSession(session) }
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        appState.deleteSession(session)
+                                    } label: {
+                                        Label("删除对话", systemImage: "trash")
+                                    }
+                                }
+                            }
+
+                            if projectSessions.isEmpty {
+                                HStack {
+                                    Text("暂无对话，点击新建")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary.opacity(0.4))
+                                        .padding(.horizontal, 16).padding(.vertical, 6)
+                                    Spacer()
                                 }
                             }
                         }
+
+                        Divider().opacity(0.08).padding(.horizontal, 4)
                     }
-                    .padding(.horizontal, 8).padding(.vertical, 4)
+
+                    // ── 底部添加项目 ──────────────────────────
+                    Button(action: { appState.addProject() }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus.circle")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary.opacity(0.5))
+                            Text("添加项目")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary.opacity(0.5))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
     }
 }
 
-// MARK: - 对话面板
+// MARK: - 项目 Accordion 行
 
-struct SessionsPanel: View {
-    @Environment(AppState.self) var appState
-    let filteredSessions: [AgentSession]
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // 操作栏
-            HStack {
-                if let proj = appState.selectedProject {
-                    HStack(spacing: 5) {
-                        Image(systemName: "folder.fill")
-                            .font(.system(size: 10))
-                            .foregroundColor(.blue.opacity(0.7))
-                        Text(proj.name)
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                    }
-                } else {
-                    Text("全部对话")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                Button(action: { appState.newSession() }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 10, weight: .semibold))
-                        Text("新建")
-                            .font(.system(size: 11))
-                    }
-                    .foregroundColor(.blue.opacity(0.9))
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(Color.blue.opacity(0.12))
-                    .cornerRadius(6)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
-
-            if filteredSessions.isEmpty {
-                Spacer()
-                VStack(spacing: 10) {
-                    Image(systemName: "bubble.left.and.bubble.right")
-                        .font(.system(size: 30))
-                        .foregroundColor(.secondary.opacity(0.25))
-                    Text(appState.selectedProject == nil ? "请先选择项目" : "暂无对话")
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary.opacity(0.5))
-                    Text(appState.selectedProject == nil ? "切换到「项目」标签\n选择或添加一个项目" : "点击右上角「新建」\n开始 Agent 对话")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary.opacity(0.35))
-                        .multilineTextAlignment(.center)
-                }
-                Spacer()
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(filteredSessions) { session in
-                            SessionRowView(
-                                session: session,
-                                isSelected: appState.selectedSessionId == session.id
-                            )
-                            .onTapGesture { appState.selectSession(session) }
-                            .contextMenu {
-                                Button(role: .destructive) {
-                                    appState.deleteSession(session)
-                                } label: {
-                                    Label("删除对话", systemImage: "trash")
-                                }
-                            }
-                        }
-                    }
-                    .padding(.vertical, 4)
-                }
-            }
-        }
-    }
-}
-
-// MARK: - 项目行
-
-struct ProjectRowView: View {
+struct ProjectAccordionRow: View {
     let project: Project
-    let isSelected: Bool
+    let isExpanded: Bool
     let sessionCount: Int
 
     var body: some View {
         HStack(spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(isSelected ? Color.blue.opacity(0.25) : Color.white.opacity(0.07))
-                    .frame(width: 30, height: 30)
-                Image(systemName: "folder.fill")
-                    .font(.system(size: 13))
-                    .foregroundColor(isSelected ? .blue : .secondary.opacity(0.6))
-            }
+            // 文件夹图标
+            Image(systemName: isExpanded ? "folder.fill" : "folder")
+                .font(.system(size: 14))
+                .foregroundColor(isExpanded ? .white : .secondary.opacity(0.55))
+                .frame(width: 18)
 
+            // 文字区
             VStack(alignment: .leading, spacing: 2) {
                 Text(project.name)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(isSelected ? .white : .primary.opacity(0.85))
+                    .font(.system(size: 12, weight: isExpanded ? .semibold : .medium))
+                    .foregroundColor(isExpanded ? .white : .primary.opacity(0.82))
                     .lineLimit(1)
-                Text(project.path)
+                Text(abbreviatePath(project.path))
                     .font(.system(size: 10))
-                    .foregroundColor(.secondary.opacity(0.45))
+                    .foregroundColor(.secondary.opacity(0.4))
                     .lineLimit(1)
                     .truncationMode(.head)
             }
 
             Spacer()
 
+            // 会话数徽标
             if sessionCount > 0 {
                 Text("\(sessionCount)")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(isSelected ? .white.opacity(0.8) : .secondary.opacity(0.5))
-                    .frame(minWidth: 18, minHeight: 18)
-                    .padding(.horizontal, 4)
-                    .background(isSelected ? Color.blue.opacity(0.5) : Color.white.opacity(0.08))
-                    .cornerRadius(5)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(isExpanded ? .white.opacity(0.7) : .secondary.opacity(0.4))
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .background(isExpanded ? Color.white.opacity(0.15) : Color.white.opacity(0.07))
+                    .cornerRadius(4)
             }
+
+            // 展开箭头
+            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.secondary.opacity(0.4))
         }
-        .padding(.horizontal, 8).padding(.vertical, 6)
-        .background(isSelected ? Color.blue.opacity(0.15) : Color.white.opacity(0.0))
-        .cornerRadius(8)
-        .contentShape(Rectangle())
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(isSelected ? Color.blue.opacity(0.3) : Color.clear, lineWidth: 1)
-        )
+        .padding(.horizontal, 12).padding(.vertical, 9)
+        .background(isExpanded ? Color.blue.opacity(0.12) : Color.clear)
+    }
+
+    func abbreviatePath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
     }
 }
 
-struct SessionRowView: View {
+// MARK: - 会话 Accordion 行
+
+struct SessionAccordionRow: View {
     let session: AgentSession
     let isSelected: Bool
+    let msgCount: Int
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(alignment: .top, spacing: 10) {
+            // 左侧选中指示条
             Rectangle()
-                .fill(isSelected ? Color.blue.opacity(0.8) : Color.clear)
+                .fill(isSelected ? Color.blue.opacity(0.85) : Color.clear)
                 .frame(width: 2)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(session.title)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(isSelected ? .white : .primary.opacity(0.85))
-                    .lineLimit(1)
-                Text(session.subtitle)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary.opacity(0.7))
-                    .lineLimit(1)
+                .padding(.vertical, 6)
+
+            // Claude 风格图标
+            ZStack {
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color(red: 0.95, green: 0.38, blue: 0.25).opacity(0.88))
+                    .frame(width: 24, height: 24)
+                Image(systemName: "asterisk")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(.white)
             }
-            .padding(.horizontal, 10).padding(.vertical, 6)
+            .padding(.top, 7)
+
+            // 标题 + 时间行
+            VStack(alignment: .leading, spacing: 3) {
+                Text(session.title)
+                    .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                    .foregroundColor(isSelected ? .white : .primary.opacity(0.82))
+                    .lineLimit(2)
+
+                HStack(spacing: 4) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary.opacity(0.45))
+                    Text(session.timestamp)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary.opacity(0.45))
+                }
+            }
+            .padding(.top, 6)
+
             Spacer()
-            Text(session.timestamp)
-                .font(.system(size: 9))
-                .foregroundColor(.secondary.opacity(0.4))
-                .padding(.trailing, 8)
+
+            // 消息数
+            if msgCount > 0 {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\(msgCount)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(isSelected ? .white.opacity(0.7) : .secondary.opacity(0.4))
+                    Image(systemName: "bubble.left")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary.opacity(0.3))
+                }
+                .padding(.top, 7)
+            }
+
+            // 活跃绿点
+            if session.isActive {
+                Circle()
+                    .fill(Color.green.opacity(0.8))
+                    .frame(width: 6, height: 6)
+                    .padding(.top, 12)
+            }
         }
-        .background(isSelected ? Color.white.opacity(0.08) : Color.clear)
-        .contentShape(Rectangle())
+        .padding(.trailing, 10)
+        .background(isSelected ? Color.white.opacity(0.07) : Color.clear)
     }
 }
 
