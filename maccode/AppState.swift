@@ -4,6 +4,7 @@ import Foundation
 import OSLog
 import Observation
 import ClaudeCodeSDK
+import SwiftAnthropic
 
 // MARK: - 调试日志
 
@@ -405,22 +406,21 @@ class AppState {
         appendMessage(ChatMessage(id: assistantMsgId, role: .assistant, blocks: [.text("")]), to: sessionId)
 
         do {
-            // 使用 .json 格式：等待完整结果，result.result 有值
-            // streamJson 格式下 result.result = null，内容在 .assistant chunk 里需要 SwiftAnthropic
+            // 使用 streamJson 格式：通过 .assistant chunk 实时获取文本和工具调用
             let result: ClaudeCodeResult
             if let sid = sdkSessionId {
                 addLog(.info, "恢复会话 \(sid.prefix(8))...")
                 result = try await client.resumeConversation(
                     sessionId: sid,
                     prompt: prompt,
-                    outputFormat: .json,
+                    outputFormat: .streamJson,
                     options: options
                 )
             } else {
                 addLog(.info, "新建对话，模型=\(settings.selectedModel)")
                 result = try await client.runSinglePrompt(
                     prompt: prompt,
-                    outputFormat: .json,
+                    outputFormat: .streamJson,
                     options: options
                 )
             }
@@ -428,34 +428,9 @@ class AppState {
             addLog(.debug, "收到结果类型：\(resultTypeName(result))")
 
             switch result {
-            case .json(let msg):
-                let text = msg.result?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if text.isEmpty {
-                    // json 格式理论上有 result，若仍为空则退一步用 streamJson 重试
-                    addLog(.error, "json result 为空，isError=\(msg.isError)，subtype=\(msg.subtype)")
-                    updateAssistantMessage(assistantMsgId, in: sessionId,
-                                          text: "⚠️ 收到空响应（isError=\(msg.isError)，subtype=\(msg.subtype)）\n请打开调试日志查看详情。")
-                } else {
-                    updateAssistantMessage(assistantMsgId, in: sessionId, text: text)
-                }
-                // 更新会话信息
-                let sdkId = msg.sessionId
-                let cost = String(format: "%.4f", msg.totalCostUsd)
-                if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
-                    sessions[idx].sdkSessionId = sdkId
-                    sessions[idx].subtitle = "费用 $\(cost) · \(msg.numTurns) 轮"
-                    sessions[idx].timestamp = "刚刚"
-                }
-                addLog(.info, "完成：费用=$\(msg.totalCostUsd)，轮数=\(msg.numTurns)，耗时=\(msg.durationMs)ms，sessionId=\(sdkId.prefix(8))")
-
-            case .text(let text):
-                updateAssistantMessage(assistantMsgId, in: sessionId, text: text)
-                addLog(.info, "收到 text 响应，长度=\(text.count)")
-
             case .stream(let publisher):
-                // 若 SDK 降级返回 stream，从 result chunk 取最终文本
-                addLog(.info, "收到 stream，等待 result chunk...")
-                var finalText: String? = nil
+                var textBuffer = ""
+                var toolBlocks: [ToolCallBlock] = []
                 var capturedSessionId: String? = nil
                 let mainPub = publisher.receive(on: DispatchQueue.main)
                 do {
@@ -465,27 +440,97 @@ class AppState {
                         case .initSystem(let m):
                             capturedSessionId = m.sessionId
                             statusText = "已连接 · \(m.tools.count) 个工具"
-                            addLog(.info, "stream initSystem sessionId=\(m.sessionId.prefix(8))")
+                            if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                                sessions[idx].sdkSessionId = m.sessionId
+                            }
+                            addLog(.info, "已连接，sessionId=\(m.sessionId.prefix(8))，工具=\(m.tools.count)个")
+
+                        case .assistant(let msg):
+                            statusText = "助手正在回复..."
+                            for content in msg.message.content {
+                                switch content {
+                                case .text(let text, _):
+                                    textBuffer = text
+                                    addLog(.debug, "assistant text 长度=\(text.count)")
+                                case .toolUse(let tool):
+                                    // 若工具调用尚未记录，则追加
+                                    if !toolBlocks.contains(where: { $0.toolId == tool.id }) {
+                                        let args = jsonDescription(tool.input)
+                                        toolBlocks.append(ToolCallBlock(
+                                            toolName: tool.name, args: args, toolId: tool.id))
+                                        addLog(.debug, "工具调用：\(tool.name)，args=\(args.prefix(80))")
+                                    }
+                                default:
+                                    break
+                                }
+                            }
+                            // 实时更新消息块：文本 + 工具调用
+                            var blocks: [MessageBlock] = []
+                            if !textBuffer.isEmpty { blocks.append(.text(textBuffer)) }
+                            for t in toolBlocks { blocks.append(.toolCall(t)) }
+                            if blocks.isEmpty { blocks = [.text("")] }
+                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: blocks)
+
+                        case .user(let msg):
+                            statusText = "工具执行中..."
+                            for content in msg.message.content {
+                                switch content {
+                                case .toolResult(let result):
+                                    if let tid = result.toolUseId {
+                                        let resultText: String
+                                        switch result.content {
+                                        case .string(let s): resultText = s
+                                        case .items(let items): resultText = items.map { _ in "(内容)" }.joined(separator: "\n")
+                                        }
+                                        updateToolResult(toolId: tid, result: resultText, in: sessionId)
+                                        addLog(.debug, "工具结果 toolId=\(tid.prefix(8))，长度=\(resultText.count)")
+                                    }
+                                default:
+                                    break
+                                }
+                            }
+
                         case .result(let m):
-                            finalText = m.result
+                            // 有时 result.result 包含最终纯文本，优先使用
+                            if let finalText = m.result, !finalText.isEmpty, finalText != textBuffer {
+                                textBuffer = finalText
+                            }
+                            var blocks: [MessageBlock] = []
+                            if !textBuffer.isEmpty { blocks.append(.text(textBuffer)) }
+                            for t in toolBlocks { blocks.append(.toolCall(t)) }
+                            if blocks.isEmpty { blocks = [.text("（操作完成）")] }
+                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: blocks)
                             let cost = String(format: "%.4f", m.totalCostUsd)
                             if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
                                 sessions[idx].sdkSessionId = capturedSessionId ?? m.sessionId
                                 sessions[idx].subtitle = "费用 $\(cost) · \(m.numTurns) 轮"
                                 sessions[idx].timestamp = "刚刚"
                             }
-                            addLog(.info, "stream result：费用=$\(m.totalCostUsd)，result=\(m.result?.prefix(50) ?? "nil")")
-                        case .assistant:
-                            statusText = "助手正在回复..."
-                        case .user:
-                            statusText = "工具执行中..."
+                            addLog(.info, "完成：费用=$\(m.totalCostUsd)，轮数=\(m.numTurns)，耗时=\(m.durationMs)ms，text长度=\(textBuffer.count)")
                         }
                     }
                 } catch {
-                    addLog(.error, "stream 中断：\(error)")
+                    if !Task.isCancelled {
+                        addLog(.error, "stream 中断：\(error)")
+                    }
                 }
-                updateAssistantMessage(assistantMsgId, in: sessionId,
-                                       text: finalText ?? "（响应完成，无文本输出）")
+
+            case .json(let msg):
+                // 兼容：json 格式直接取 result 字段
+                let text = msg.result?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                updateAssistantBlocks(assistantMsgId, in: sessionId,
+                                      blocks: [.text(text.isEmpty ? "（操作完成）" : text)])
+                let cost = String(format: "%.4f", msg.totalCostUsd)
+                if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                    sessions[idx].sdkSessionId = msg.sessionId
+                    sessions[idx].subtitle = "费用 $\(cost) · \(msg.numTurns) 轮"
+                    sessions[idx].timestamp = "刚刚"
+                }
+                addLog(.info, "json 完成，text 长度=\(text.count)")
+
+            case .text(let text):
+                updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: [.text(text)])
+                addLog(.info, "收到 text 响应，长度=\(text.count)")
             }
 
         } catch let error as ClaudeCodeError {
@@ -605,6 +650,48 @@ class AppState {
     private func updateAssistantMessage(_ id: UUID, in sessionId: UUID, text: String) {
         guard let idx = messagesBySession[sessionId]?.firstIndex(where: { $0.id == id }) else { return }
         messagesBySession[sessionId]?[idx].blocks = [.text(text)]
+    }
+
+    private func updateAssistantBlocks(_ id: UUID, in sessionId: UUID, blocks: [MessageBlock]) {
+        guard let idx = messagesBySession[sessionId]?.firstIndex(where: { $0.id == id }) else { return }
+        messagesBySession[sessionId]?[idx].blocks = blocks
+    }
+
+    /// 更新指定工具调用的结果（在当前会话所有消息中查找）
+    private func updateToolResult(toolId: String, result: String, in sessionId: UUID) {
+        guard let msgs = messagesBySession[sessionId] else { return }
+        for (mi, msg) in msgs.enumerated() {
+            for (bi, block) in msg.blocks.enumerated() {
+                if case .toolCall(let tc) = block, tc.toolId == toolId {
+                    messagesBySession[sessionId]?[mi].blocks[bi] =
+                        .toolCall(ToolCallBlock(toolName: tc.toolName, args: tc.args,
+                                               result: result, toolId: toolId))
+                    return
+                }
+            }
+        }
+    }
+
+    /// 将工具输入字典转换为可读字符串
+    private func jsonDescription(_ input: MessageResponse.Content.Input) -> String {
+        let parts = input.map { "\($0.key): \(dynamicDescription($0.value))" }
+        return parts.joined(separator: ", ")
+    }
+
+    private func dynamicDescription(_ value: MessageResponse.Content.DynamicContent) -> String {
+        switch value {
+        case .string(let s): return s
+        case .integer(let i): return "\(i)"
+        case .double(let d): return "\(d)"
+        case .bool(let b): return "\(b)"
+        case .dictionary(let dict):
+            let parts = dict.map { "\($0.key): \(dynamicDescription($0.value))" }
+            return "{\(parts.joined(separator: ", "))}"
+        case .array(let arr):
+            return "[\(arr.map { dynamicDescription($0) }.joined(separator: ", "))]"
+        case .null:
+            return "null"
+        }
     }
 
     private func removeMessage(_ id: UUID, from sessionId: UUID) {

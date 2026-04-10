@@ -287,8 +287,14 @@ struct ProjectTreePanel: View {
                         )
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            withAnimation(.easeInOut(duration: 0.22)) {
-                                appState.selectProject(project)
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.78)) {
+                                if isExpanded {
+                                    // 再次点击已展开项目 → 收起
+                                    appState.selectedProjectId = nil
+                                    appState.selectedSessionId = nil
+                                } else {
+                                    appState.selectProject(project)
+                                }
                             }
                         }
                         .contextMenu {
@@ -1146,13 +1152,28 @@ struct AgentInputView: View {
 
 // MARK: - 文件面板
 
+struct FileItem: Identifiable {
+    let id = UUID()
+    let name: String
+    let isDirectory: Bool
+    let path: String
+}
+
 struct FilesPanel: View {
     @Binding var showFiles: Bool
     let session: AgentSession?
     @State private var searchText = ""
+    @State private var fileItems: [FileItem] = []
+    @State private var rootDir: String? = nil
+
+    var filteredItems: [FileItem] {
+        guard !searchText.isEmpty else { return fileItems }
+        return fileItems.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
+            // 头部
             HStack(spacing: 8) {
                 Image(systemName: "folder")
                     .font(.system(size: 11))
@@ -1161,16 +1182,12 @@ struct FilesPanel: View {
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if let dir = session?.workingDirectory {
-                    HStack(spacing: 4) {
-                        Image(systemName: "folder.fill")
-                            .font(.system(size: 9))
-                        Text(URL(fileURLWithPath: dir).lastPathComponent)
-                            .font(.system(size: 10))
-                    }
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 6).padding(.vertical, 3)
-                    .background(Color.white.opacity(0.06))
-                    .cornerRadius(5)
+                    Text(URL(fileURLWithPath: dir).lastPathComponent)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(Color.white.opacity(0.06))
+                        .cornerRadius(5)
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 10)
@@ -1188,11 +1205,40 @@ struct FilesPanel: View {
             }
             .padding(.horizontal, 8).padding(.vertical, 4)
             .background(Color.white.opacity(0.05)).cornerRadius(5)
-            .padding(.horizontal, 10).padding(.bottom, 6)
+            .padding(.horizontal, 10).padding(.bottom, 4)
 
             Divider().opacity(0.2)
 
-            if session?.workingDirectory == nil {
+            if let dir = session?.workingDirectory {
+                if filteredItems.isEmpty && searchText.isEmpty {
+                    VStack(spacing: 8) {
+                        Spacer()
+                        ProgressView().scaleEffect(0.7)
+                        Text("加载中...")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.5))
+                        Spacer()
+                    }
+                } else if filteredItems.isEmpty {
+                    VStack {
+                        Spacer()
+                        Text("无匹配文件")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary.opacity(0.4))
+                        Spacer()
+                    }
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(filteredItems) { item in
+                                FileItemRow(item: item, rootDir: dir)
+                            }
+                        }
+                    }
+                }
+                // 加载文件列表
+                let _ = dir  // 触发重新计算
+            } else {
                 VStack(spacing: 8) {
                     Spacer()
                     Image(systemName: "folder.badge.questionmark")
@@ -1203,18 +1249,87 @@ struct FilesPanel: View {
                         .foregroundColor(.secondary.opacity(0.6))
                     Spacer()
                 }
-            } else {
-                VStack(spacing: 8) {
-                    Spacer()
-                    Image(systemName: "doc.text")
-                        .font(.system(size: 24))
-                        .foregroundColor(.secondary.opacity(0.4))
-                    Text("文件列表\n（功能开发中）")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary.opacity(0.6))
-                        .multilineTextAlignment(.center)
-                    Spacer()
-                }
+            }
+        }
+        .onChange(of: session?.workingDirectory) { _, newDir in
+            if let dir = newDir { loadFiles(from: dir) }
+            else { fileItems = [] }
+        }
+        .onAppear {
+            if let dir = session?.workingDirectory { loadFiles(from: dir) }
+        }
+    }
+
+    func loadFiles(from dir: String) {
+        rootDir = dir
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(atPath: dir) else {
+            fileItems = []; return
+        }
+        fileItems = items
+            .filter { !$0.hasPrefix(".") }
+            .map { name -> FileItem in
+                let path = (dir as NSString).appendingPathComponent(name)
+                var isDir: ObjCBool = false
+                fm.fileExists(atPath: path, isDirectory: &isDir)
+                return FileItem(name: name, isDirectory: isDir.boolValue, path: path)
+            }
+            .sorted { a, b in
+                if a.isDirectory != b.isDirectory { return a.isDirectory }
+                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            }
+    }
+}
+
+struct FileItemRow: View {
+    let item: FileItem
+    let rootDir: String
+
+    var icon: String {
+        if item.isDirectory { return "folder" }
+        let ext = (item.name as NSString).pathExtension.lowercased()
+        switch ext {
+        case "swift": return "swift"
+        case "js", "ts", "jsx", "tsx": return "doc.text"
+        case "py": return "doc.text"
+        case "json", "yaml", "yml", "toml": return "curlybraces"
+        case "md": return "text.alignleft"
+        case "png", "jpg", "jpeg", "gif", "svg": return "photo"
+        case "pdf": return "doc.richtext"
+        default: return "doc"
+        }
+    }
+
+    var iconColor: Color {
+        if item.isDirectory { return .blue.opacity(0.75) }
+        let ext = (item.name as NSString).pathExtension.lowercased()
+        switch ext {
+        case "swift": return .orange
+        case "js", "ts", "jsx", "tsx": return .yellow
+        case "py": return .blue
+        case "json", "yaml", "yml": return .green
+        case "md": return .secondary
+        default: return .secondary.opacity(0.7)
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundColor(iconColor)
+                .frame(width: 14)
+            Text(item.name)
+                .font(.system(size: 12))
+                .foregroundColor(item.isDirectory ? .primary.opacity(0.85) : .primary.opacity(0.7))
+                .lineLimit(1)
+            Spacer()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 5)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if !item.isDirectory {
+                NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: rootDir)
             }
         }
     }
