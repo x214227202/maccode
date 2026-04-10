@@ -59,7 +59,11 @@ private func isSystemMessage(_ content: String) -> Bool {
 @MainActor
 class AppState {
 
-    // MARK: 会话列表
+    // MARK: 项目列表
+    var projects: [Project] = []
+    var selectedProjectId: UUID?
+
+    // MARK: 会话列表（全部）
     var sessions: [AgentSession] = []
     var selectedSessionId: UUID?
 
@@ -84,6 +88,20 @@ class AppState {
 
     // MARK: 计算属性
 
+    /// 当前选中项目
+    var selectedProject: Project? {
+        projects.first { $0.id == selectedProjectId }
+    }
+
+    /// 当前项目下的会话（按最近时间排序）
+    var currentProjectSessions: [AgentSession] {
+        guard let proj = selectedProject else {
+            // 未选项目：显示无目录的会话
+            return sessions.filter { $0.workingDirectory == nil }
+        }
+        return sessions.filter { $0.workingDirectory == proj.path }
+    }
+
     var selectedSession: AgentSession? {
         sessions.first { $0.id == selectedSessionId }
     }
@@ -97,6 +115,7 @@ class AppState {
 
     init() {
         initializeClient()
+        loadSavedProjects()
     }
 
     func initializeClient() {
@@ -118,10 +137,75 @@ class AppState {
         }
     }
 
+    // MARK: 项目管理
+
+    /// 打开目录选择器添加新项目
+    func addProject() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "添加项目"
+        panel.message = "选择项目根目录"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        // 若已存在同路径项目，直接切换
+        if let existing = projects.first(where: { $0.path == url.path }) {
+            selectedProjectId = existing.id
+            selectedSessionId = currentProjectSessions.first?.id
+            addLog(.info, "切换到已有项目：\(url.path)")
+            return
+        }
+
+        let proj = Project(name: url.lastPathComponent, path: url.path)
+        projects.insert(proj, at: 0)
+        selectedProjectId = proj.id
+        selectedSessionId = nil
+        saveProjects()
+        addLog(.info, "添加项目：\(url.path)")
+    }
+
+    /// 删除项目（不删除会话数据）
+    func removeProject(_ project: Project) {
+        projects.removeAll { $0.id == project.id }
+        if selectedProjectId == project.id {
+            selectedProjectId = projects.first?.id
+            selectedSessionId = currentProjectSessions.first?.id
+        }
+        saveProjects()
+        addLog(.info, "移除项目：\(project.path)")
+    }
+
+    /// 选中项目
+    func selectProject(_ project: Project) {
+        selectedProjectId = project.id
+        // 自动选中该项目最近的会话
+        selectedSessionId = currentProjectSessions.first?.id
+        errorMessage = nil
+        addLog(.info, "切换项目：\(project.name)")
+    }
+
+    /// 持久化项目列表
+    private func saveProjects() {
+        if let data = try? JSONEncoder().encode(projects) {
+            UserDefaults.standard.set(data, forKey: "savedProjects")
+        }
+    }
+
+    private func loadSavedProjects() {
+        guard let data = UserDefaults.standard.data(forKey: "savedProjects"),
+              let saved = try? JSONDecoder().decode([Project].self, from: data) else { return }
+        projects = saved
+        selectedProjectId = projects.first?.id
+        addLog(.info, "从本地加载 \(projects.count) 个项目")
+    }
+
     // MARK: 会话管理
 
     func newSession(workingDir: String? = nil) {
-        let dir = workingDir ?? settings.effectiveWorkingDirectory
+        // 优先用当前选中项目的路径
+        let dir = workingDir ?? selectedProject?.path ?? settings.effectiveWorkingDirectory
         let session = AgentSession(
             title: "新对话",
             subtitle: dir.flatMap { URL(fileURLWithPath: $0).lastPathComponent } ?? "未选择目录",
@@ -132,7 +216,17 @@ class AppState {
         selectedSessionId = session.id
         messagesBySession[session.id] = []
         errorMessage = nil
-        addLog(.info, "新建会话 \(session.id)")
+
+        // 若当前没有项目且有目录，自动创建项目
+        if let dir, selectedProject?.path != dir {
+            if !projects.contains(where: { $0.path == dir }) {
+                let proj = Project(name: URL(fileURLWithPath: dir).lastPathComponent, path: dir)
+                projects.insert(proj, at: 0)
+                selectedProjectId = proj.id
+                saveProjects()
+            }
+        }
+        addLog(.info, "新建会话，目录=\(dir ?? "无")")
     }
 
     func selectSession(_ session: AgentSession) {
@@ -216,8 +310,33 @@ class AppState {
 
                 if !loaded.isEmpty {
                     sessions = loaded
-                    selectedSessionId = loaded.first?.id
-                    addLog(.info, "成功加载 \(loaded.count) 个会话")
+
+                    // 从历史会话中自动发现项目（去重）
+                    var discoveredPaths = Set<String>()
+                    var newProjects: [Project] = []
+                    for session in loaded {
+                        guard let path = session.workingDirectory,
+                              !path.isEmpty,
+                              !discoveredPaths.contains(path),
+                              !projects.contains(where: { $0.path == path }) else { continue }
+                        discoveredPaths.insert(path)
+                        newProjects.append(Project(
+                            name: URL(fileURLWithPath: path).lastPathComponent,
+                            path: path
+                        ))
+                    }
+                    if !newProjects.isEmpty {
+                        projects.append(contentsOf: newProjects)
+                        saveProjects()
+                        addLog(.info, "自动发现 \(newProjects.count) 个新项目")
+                    }
+
+                    // 若没有已选项目，默认选第一个
+                    if selectedProjectId == nil {
+                        selectedProjectId = projects.first?.id
+                    }
+                    selectedSessionId = currentProjectSessions.first?.id
+                    addLog(.info, "成功加载 \(loaded.count) 个会话，\(projects.count) 个项目")
                 } else {
                     addLog(.info, "未找到有效历史会话")
                 }
