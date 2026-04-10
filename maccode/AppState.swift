@@ -1,8 +1,57 @@
 import AppKit
 import Combine
 import Foundation
+import OSLog
 import Observation
 import ClaudeCodeSDK
+
+// MARK: - 调试日志
+
+let log = Logger(subsystem: "com.nl.maccode", category: "AppState")
+
+// MARK: - 消息内容清洗
+
+private func cleanContent(_ raw: String) -> String {
+    var s = raw
+
+    // 移除 <local-command-caveat>...</local-command-caveat> 块
+    while let r = s.range(of: "<local-command-caveat>", options: .caseInsensitive),
+          let e = s.range(of: "</local-command-caveat>", options: .caseInsensitive),
+          r.lowerBound <= e.lowerBound {
+        s.removeSubrange(r.lowerBound..<e.upperBound)
+    }
+
+    // 移除其他 XML/命令标签块（<command-name>, <command-message> 等）
+    let tagPatterns = [
+        "<command-name>", "</command-name>",
+        "<command-message>", "</command-message>",
+        "<command-args>", "</command-args>",
+        "<local-command-caveat>", "</local-command-caveat>",
+    ]
+    for tag in tagPatterns {
+        s = s.replacingOccurrences(of: tag, with: "", options: .caseInsensitive)
+    }
+
+    return s.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// 判断消息内容是否为系统/无效消息，应被过滤掉
+private func isSystemMessage(_ content: String) -> Bool {
+    let lower = content.lowercased()
+    let systemPrefixes = [
+        "<local-command-caveat>",
+        "<command-name>",
+        "caveat: the messages below",
+        "do not respond to these messages",
+    ]
+    for prefix in systemPrefixes {
+        if lower.contains(prefix) { return true }
+    }
+    // 纯 XML 标签行
+    let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("<") && trimmed.hasSuffix(">") { return true }
+    return false
+}
 
 // MARK: - 应用全局状态
 
@@ -22,6 +71,9 @@ class AppState {
     var statusText: String = ""
     var errorMessage: String?
     var isClaudeInstalled: Bool = true
+
+    // MARK: 调试日志（最新 200 条）
+    var debugLogs: [DebugLogEntry] = []
 
     // MARK: 设置
     let settings = AppSettings.shared
@@ -53,13 +105,16 @@ class AppState {
             config.enableDebugLogging = false
             client = try ClaudeCodeClient(configuration: config)
             isClaudeInstalled = true
+            addLog(.info, "ClaudeCodeClient 初始化成功")
         } catch let error as ClaudeCodeError {
             if error.isInstallationError {
                 isClaudeInstalled = false
                 errorMessage = "未找到 claude 命令。\n请先安装：npm install -g @anthropic/claude-code"
+                addLog(.error, "claude 未安装：\(error)")
             }
         } catch {
             errorMessage = "客户端初始化失败：\(error.localizedDescription)"
+            addLog(.error, "初始化失败：\(error)")
         }
     }
 
@@ -77,11 +132,13 @@ class AppState {
         selectedSessionId = session.id
         messagesBySession[session.id] = []
         errorMessage = nil
+        addLog(.info, "新建会话 \(session.id)")
     }
 
     func selectSession(_ session: AgentSession) {
         selectedSessionId = session.id
         errorMessage = nil
+        addLog(.info, "切换会话 \(session.sdkSessionId ?? session.id.uuidString)")
     }
 
     func deleteSession(_ session: AgentSession) {
@@ -90,15 +147,18 @@ class AppState {
         if selectedSessionId == session.id {
             selectedSessionId = sessions.first?.id
         }
+        addLog(.info, "删除会话 \(session.id)")
     }
 
     // MARK: 加载已有会话（从 Claude 本地存储）
 
     func loadExistingSessions() {
         Task {
+            addLog(.info, "开始加载历史会话...")
             do {
                 let storage = ClaudeNativeSessionStorage()
                 let stored = try await storage.getAllSessions()
+                addLog(.info, "共找到 \(stored.count) 个历史会话")
 
                 let dateFormatter = DateFormatter()
                 dateFormatter.locale = Locale(identifier: "zh_CN")
@@ -108,17 +168,34 @@ class AppState {
 
                 var loaded: [AgentSession] = []
                 for s in stored.sorted(by: { $0.lastAccessedAt > $1.lastAccessedAt }).prefix(100) {
+
+                    // 过滤有效消息（去除系统消息）
+                    let validMessages = s.messages.filter { msg in
+                        !isSystemMessage(msg.content) && !msg.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    }
+
+                    // 如果会话完全没有有效消息，跳过
+                    if validMessages.isEmpty && s.summary == nil {
+                        addLog(.debug, "跳过空会话 \(s.id.prefix(8))")
+                        continue
+                    }
+
+                    // 生成会话标题
                     let title: String
                     if let summary = s.summary, !summary.isEmpty {
                         title = String(summary.prefix(60))
+                    } else if let firstUserMsg = validMessages.first(where: { $0.role == .user }) {
+                        let cleaned = cleanContent(firstUserMsg.content)
+                        title = String(cleaned.prefix(50)).replacingOccurrences(of: "\n", with: " ")
                     } else {
                         title = "会话 \(s.id.prefix(8))"
                     }
+
                     let subtitle = URL(fileURLWithPath: s.projectPath).lastPathComponent
                     let timestamp = dateFormatter.string(from: s.lastAccessedAt)
 
                     var session = AgentSession(
-                        title: title,
+                        title: title.isEmpty ? "会话 \(s.id.prefix(8))" : title,
                         subtitle: subtitle,
                         timestamp: timestamp,
                         workingDirectory: s.projectPath
@@ -126,20 +203,26 @@ class AppState {
                     session.sdkSessionId = s.id
 
                     loaded.append(session)
-                    // 加载消息摘要（取最后几条）
-                    let recentMsgs = s.messages.suffix(20)
-                    messagesBySession[session.id] = recentMsgs.map { msg in
+
+                    // 加载并清洗最近消息
+                    let recentMsgs = validMessages.suffix(30)
+                    messagesBySession[session.id] = recentMsgs.compactMap { msg in
+                        let cleaned = cleanContent(msg.content)
+                        guard !cleaned.isEmpty else { return nil }
                         let role: MessageRole = msg.role == .user ? .user : .assistant
-                        return ChatMessage(role: role, blocks: [.text(msg.content)])
+                        return ChatMessage(role: role, blocks: [.text(cleaned)])
                     }
                 }
 
                 if !loaded.isEmpty {
                     sessions = loaded
                     selectedSessionId = loaded.first?.id
+                    addLog(.info, "成功加载 \(loaded.count) 个会话")
+                } else {
+                    addLog(.info, "未找到有效历史会话")
                 }
             } catch {
-                // 静默失败，以空会话列表开始
+                addLog(.error, "加载历史会话失败：\(error)")
             }
         }
     }
@@ -150,16 +233,13 @@ class AppState {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        // 如果没有会话则新建
         if selectedSession == nil {
             newSession()
         }
         guard let session = selectedSession else { return }
 
-        // 取消正在进行的流
         streamTask?.cancel()
 
-        // 添加用户消息
         appendMessage(ChatMessage(role: .user, blocks: [.text(trimmed)]), to: session.id)
 
         isLoading = true
@@ -169,6 +249,8 @@ class AppState {
         let sessionId = session.id
         let sdkSessionId = session.sdkSessionId
         let workingDir = session.workingDirectory ?? settings.effectiveWorkingDirectory
+
+        addLog(.info, "发送消息，会话=\(sdkSessionId ?? "新建")，目录=\(workingDir ?? "无")")
 
         streamTask = Task {
             await doSend(
@@ -185,10 +267,10 @@ class AppState {
             errorMessage = "Claude Code 客户端未初始化，请检查 claude 是否已安装"
             isLoading = false
             statusText = ""
+            addLog(.error, "客户端未初始化")
             return
         }
 
-        // 更新工作目录配置
         var config = client.configuration
         config.workingDirectory = workingDir
         if let apiKey = settings.anthropicApiKey.nilIfEmpty {
@@ -196,18 +278,17 @@ class AppState {
         }
         client.configuration = config
 
-        // 构建选项
         var options = ClaudeCodeOptions()
         options.model = settings.selectedModel
         options.maxTurns = settings.maxTurns
 
-        // 创建助手消息占位
         let assistantMsgId = UUID()
         appendMessage(ChatMessage(id: assistantMsgId, role: .assistant, blocks: [.text("")]), to: sessionId)
 
         do {
             let result: ClaudeCodeResult
             if let sid = sdkSessionId {
+                addLog(.info, "恢复会话 \(sid.prefix(8))...")
                 result = try await client.resumeConversation(
                     sessionId: sid,
                     prompt: prompt,
@@ -215,6 +296,7 @@ class AppState {
                     options: options
                 )
             } else {
+                addLog(.info, "新建对话，模型=\(settings.selectedModel)")
                 result = try await client.runSinglePrompt(
                     prompt: prompt,
                     outputFormat: .streamJson,
@@ -231,17 +313,21 @@ class AppState {
                     }
                 } catch {
                     if !Task.isCancelled {
+                        addLog(.error, "流中断：\(error)")
                         errorMessage = "流式响应中断：\(error.localizedDescription)"
                     }
                 }
             } else if case .text(let text) = result {
                 updateAssistantMessage(assistantMsgId, in: sessionId, text: text)
+                addLog(.info, "收到文本响应，长度=\(text.count)")
             } else if case .json(let msg) = result {
                 updateAssistantMessage(assistantMsgId, in: sessionId, text: msg.result ?? "（操作完成，无文本输出）")
+                addLog(.info, "收到 JSON 响应，费用=$\(msg.totalCostUsd)")
             }
 
         } catch let error as ClaudeCodeError {
             removeMessage(assistantMsgId, from: sessionId)
+            addLog(.error, "ClaudeCodeError：\(error)")
             switch error {
             case .notInstalled:
                 errorMessage = "未找到 claude 命令\n请运行：npm install -g @anthropic/claude-code"
@@ -258,6 +344,7 @@ class AppState {
         } catch {
             removeMessage(assistantMsgId, from: sessionId)
             if !Task.isCancelled {
+                addLog(.error, "未知错误：\(error)")
                 errorMessage = "请求失败：\(error.localizedDescription)"
             }
         }
@@ -270,28 +357,29 @@ class AppState {
     private func processChunk(_ chunk: ResponseChunk, sessionId: UUID, assistantMsgId: UUID) {
         switch chunk {
         case .initSystem(let msg):
-            statusText = "已连接 · \(msg.tools.count) 个工具可用"
-            // 更新会话的 SDK 会话 ID（用于后续恢复）
+            statusText = "已连接 · \(msg.tools.count) 个工具"
+            addLog(.info, "已连接，SDK 会话 ID=\(msg.sessionId.prefix(8))，工具=\(msg.tools.joined(separator: ","))")
             if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
                 sessions[idx].sdkSessionId = msg.sessionId
             }
 
         case .assistant:
             statusText = "助手正在回复..."
+            addLog(.debug, "收到 assistant chunk")
 
         case .user:
             statusText = "工具执行中..."
+            addLog(.debug, "收到 user chunk（工具结果）")
 
         case .result(let msg):
             let text = msg.result ?? "（操作完成）"
             updateAssistantMessage(assistantMsgId, in: sessionId, text: text)
-            // 更新会话副标题（显示费用）
             if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
                 let cost = String(format: "%.4f", msg.totalCostUsd)
-                let turns = msg.numTurns
-                sessions[idx].subtitle = "费用 $\(cost) · \(turns) 轮对话"
+                sessions[idx].subtitle = "费用 $\(cost) · \(msg.numTurns) 轮"
                 sessions[idx].timestamp = "刚刚"
             }
+            addLog(.info, "响应完成，费用=$\(msg.totalCostUsd)，轮数=\(msg.numTurns)，耗时=\(msg.durationMs)ms")
             statusText = ""
         }
     }
@@ -301,6 +389,7 @@ class AppState {
         streamTask = nil
         isLoading = false
         statusText = ""
+        addLog(.info, "用户取消响应")
     }
 
     // MARK: 选择工作目录
@@ -315,12 +404,30 @@ class AppState {
 
         if panel.runModal() == .OK, let url = panel.url {
             settings.workingDirectory = url.path
-            // 同步更新当前会话的工作目录
+            addLog(.info, "设置工作目录：\(url.path)")
             if let idx = sessions.firstIndex(where: { $0.id == selectedSessionId }) {
                 sessions[idx].workingDirectory = url.path
                 sessions[idx].subtitle = url.lastPathComponent
             }
         }
+    }
+
+    // MARK: 调试日志
+
+    func addLog(_ level: DebugLogEntry.Level, _ message: String) {
+        let entry = DebugLogEntry(level: level, message: message)
+        debugLogs.append(entry)
+        if debugLogs.count > 200 { debugLogs.removeFirst() }
+        // 同步到 OSLog
+        switch level {
+        case .debug: log.debug("\(message)")
+        case .info:  log.info("\(message)")
+        case .error: log.error("\(message)")
+        }
+    }
+
+    func clearLogs() {
+        debugLogs.removeAll()
     }
 
     // MARK: 私有工具方法
@@ -342,10 +449,32 @@ class AppState {
     }
 }
 
+// MARK: - 调试日志条目
+
+struct DebugLogEntry: Identifiable {
+    enum Level { case debug, info, error }
+    let id = UUID()
+    let level: Level
+    let message: String
+    let time = Date()
+
+    var timeString: String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f.string(from: time)
+    }
+
+    var color: String {
+        switch level {
+        case .debug: return "secondary"
+        case .info:  return "primary"
+        case .error: return "red"
+        }
+    }
+}
+
 // MARK: - 辅助扩展
 
 private extension String {
-    var nilIfEmpty: String? {
-        isEmpty ? nil : self
-    }
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

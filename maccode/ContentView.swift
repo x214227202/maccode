@@ -57,10 +57,11 @@ struct ContentView: View {
     @Environment(AppState.self) var appState
     @State private var columnVisibility = NavigationSplitViewVisibility.all
     @State private var showFiles = true
+    @State private var showDebugLog = false
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView()
+            SidebarView(showDebugLog: $showDebugLog)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 400)
         } detail: {
             ChatView(showFiles: $showFiles)
@@ -69,6 +70,10 @@ struct ContentView: View {
         .onAppear {
             appState.loadExistingSessions()
         }
+        .sheet(isPresented: $showDebugLog) {
+            DebugLogView()
+                .environment(appState)
+        }
     }
 }
 
@@ -76,6 +81,7 @@ struct ContentView: View {
 
 struct SidebarView: View {
     @Environment(AppState.self) var appState
+    @Binding var showDebugLog: Bool
     @State private var searchText = ""
     @State private var showSettings = false
     @State private var refreshRotation: Double = 0
@@ -173,6 +179,15 @@ struct SidebarView: View {
                 }
                 .buttonStyle(.plain)
                 Spacer()
+                // 调试日志按钮
+                Button(action: { showDebugLog = true }) {
+                    Image(systemName: "ladybug")
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary.opacity(0.55))
+                }
+                .buttonStyle(.plain)
+                .help("调试日志")
+
                 Button(action: { showSettings = true }) {
                     Image(systemName: "gearshape")
                         .font(.system(size: 13))
@@ -1241,6 +1256,105 @@ struct SettingsShortcutRow: View {
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
         Divider().opacity(0.15).padding(.leading, 14)
+    }
+}
+
+// MARK: - 调试日志视图
+
+struct DebugLogView: View {
+    @Environment(AppState.self) var appState
+    @Environment(\.dismiss) private var dismiss
+    @State private var autoScroll = true
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // 标题栏
+            HStack {
+                Image(systemName: "ladybug").foregroundColor(.green)
+                Text("调试日志").font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Toggle("自动滚动", isOn: $autoScroll)
+                    .toggleStyle(.switch).scaleEffect(0.75)
+                    .labelsHidden()
+                Text("自动滚动").font(.system(size: 12)).foregroundColor(.secondary)
+                Button(action: { appState.clearLogs() }) {
+                    Text("清空").font(.system(size: 12))
+                        .foregroundColor(.orange)
+                }.buttonStyle(.plain).padding(.leading, 8)
+                Button(action: { dismiss() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .frame(width: 22, height: 22)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Circle())
+                }.buttonStyle(.plain)
+            }
+            .padding(.horizontal, 20).padding(.vertical, 14)
+
+            Divider().opacity(0.2)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(appState.debugLogs) { entry in
+                            HStack(alignment: .top, spacing: 8) {
+                                Text(entry.timeString)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary.opacity(0.6))
+                                    .frame(width: 90, alignment: .leading)
+
+                                // 级别标签
+                                Group {
+                                    switch entry.level {
+                                    case .debug:
+                                        Text("DEBUG")
+                                            .foregroundColor(.secondary)
+                                    case .info:
+                                        Text("INFO ")
+                                            .foregroundColor(.green)
+                                    case .error:
+                                        Text("ERROR")
+                                            .foregroundColor(.red)
+                                    }
+                                }
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .frame(width: 40, alignment: .leading)
+
+                                Text(entry.message)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(entry.level == .error ? .red.opacity(0.9) : .primary.opacity(0.85))
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(.horizontal, 14).padding(.vertical, 3)
+                            .background(entry.level == .error ? Color.red.opacity(0.06) : Color.clear)
+                            .id(entry.id)
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+                .onChange(of: appState.debugLogs.count) { _, _ in
+                    if autoScroll, let last = appState.debugLogs.last {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                }
+            }
+
+            Divider().opacity(0.2)
+            HStack {
+                Text("\(appState.debugLogs.count) 条日志")
+                    .font(.system(size: 11)).foregroundColor(.secondary)
+                Spacer()
+                if !appState.isClaudeInstalled {
+                    Text("⚠️ claude 命令未找到").font(.system(size: 11)).foregroundColor(.orange)
+                }
+            }
+            .padding(.horizontal, 14).padding(.vertical, 8)
+        }
+        .frame(width: 720, height: 480)
+        .background(Color(white: 0.10))
+        .preferredColorScheme(.dark)
     }
 }
 
