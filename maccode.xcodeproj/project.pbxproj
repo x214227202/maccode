@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		CCAABB0033334444FFFFFFFF /* ClaudeCodeSDK in Frameworks */ = {isa = PBXBuildFile; productRef = CCAABB0022223333FFFFFFFF /* ClaudeCodeSDK */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		F77943042F881A0000D8D927 /* maccode.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = maccode.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				CCAABB0033334444FFFFFFFF /* ClaudeCodeSDK in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = maccode;
 			packageProductDependencies = (
+				CCAABB0022223333FFFFFFFF /* ClaudeCodeSDK */,
 			);
 			productName = maccode;
 			productReference = F77943042F881A0000D8D927 /* maccode.app */;
@@ -94,6 +100,9 @@
 			);
 			mainGroup = F77942FB2F881A0000D8D927;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				CCAABB0011112222FFFFFFFF /* XCLocalSwiftPackageReference "../ClaudeCodeSDK_extracted/ClaudeCodeSDK-1.2.4" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = F77943052F881A0000D8D927 /* Products */;
 			projectDirPath = "";
@@ -251,7 +260,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -269,7 +278,7 @@
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;
 		};
@@ -281,7 +290,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -299,7 +308,7 @@
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
-				SWIFT_VERSION = 5.0;
+				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
 		};
@@ -325,6 +334,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		CCAABB0011112222FFFFFFFF /* XCLocalSwiftPackageReference "../ClaudeCodeSDK_extracted/ClaudeCodeSDK-1.2.4" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "../ClaudeCodeSDK_extracted/ClaudeCodeSDK-1.2.4";
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		CCAABB0022223333FFFFFFFF /* ClaudeCodeSDK */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CCAABB0011112222FFFFFFFF /* XCLocalSwiftPackageReference "../ClaudeCodeSDK_extracted/ClaudeCodeSDK-1.2.4" */;
+			productName = ClaudeCodeSDK;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = F77942FC2F881A0000D8D927 /* Project object */;
 }
