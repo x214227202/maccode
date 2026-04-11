@@ -280,11 +280,17 @@ class AppState {
                 dateFormatter.dateStyle = .short
                 dateFormatter.timeStyle = .none
 
+                // 建立 sdkSessionId → 已有 app UUID 的映射，确保 UUID 稳定
+                let existingSdkIdToAppId: [String: UUID] = Dictionary(
+                    uniqueKeysWithValues: sessions.compactMap { s in
+                        s.sdkSessionId.map { ($0, s.id) }
+                    }
+                )
+
                 var loaded: [AgentSession] = []
                 for s in stored.sorted(by: { $0.lastAccessedAt > $1.lastAccessedAt }).prefix(100) {
 
                     // 清洗并过滤有效消息（先 cleanContent 再判空，避免因 caveat 误杀真实用户消息）
-                    // isSystemMessage 只用来过滤「纯系统消息」，不影响混合 caveat 的用户消息
                     let cleanedMessages: [(msg: ClaudeStoredMessage, cleaned: String)] = s.messages.compactMap { msg in
                         guard msg.role != .system else { return nil }
                         let cleaned = cleanContent(msg.content)
@@ -308,28 +314,33 @@ class AppState {
                         title = "会话 \(s.id.prefix(8))"
                     }
 
-                    // 优先从 JSONL cwd 字段获取真实路径（SDK decode 会把 "." 误转成 "/"）
+                    // 优先从 JSONL cwd 字段获取真实路径
                     let actualWorkDir = s.messages.first(where: { $0.cwd != nil })?.cwd ?? s.projectPath
                     let subtitle = URL(fileURLWithPath: actualWorkDir).lastPathComponent
                     let timestamp = dateFormatter.string(from: s.lastAccessedAt)
 
+                    // ── 关键：复用已有 UUID，防止 selectedSessionId 失效 ──
+                    let stableId = existingSdkIdToAppId[s.id] ?? UUID()
                     var session = AgentSession(
                         title: title.isEmpty ? "会话 \(s.id.prefix(8))" : title,
                         subtitle: subtitle,
                         timestamp: timestamp,
                         workingDirectory: actualWorkDir
                     )
+                    session.id = stableId
                     session.sdkSessionId = s.id
 
                     loaded.append(session)
 
-                    // 加载最近 30 条有效消息
-                    let recentMsgs = cleanedMessages.suffix(30)
-                    messagesBySession[session.id] = recentMsgs.map { item in
-                        let role: MessageRole = item.msg.role == .user ? .user : .assistant
-                        return ChatMessage(role: role, blocks: [.text(item.cleaned)])
+                    // 若 UUID 未变，messagesBySession 已有数据则跳过重载（节省内存 + 避免清空流式消息）
+                    if existingSdkIdToAppId[s.id] == nil || messagesBySession[stableId] == nil {
+                        let recentMsgs = cleanedMessages.suffix(30)
+                        messagesBySession[stableId] = recentMsgs.map { item in
+                            let role: MessageRole = item.msg.role == .user ? .user : .assistant
+                            return ChatMessage(role: role, blocks: [.text(item.cleaned)])
+                        }
+                        addLog(.debug, "会话 \(s.id.prefix(8))：加载 \(recentMsgs.count) 条消息")
                     }
-                    addLog(.debug, "会话 \(s.id.prefix(8))：加载 \(recentMsgs.count) 条消息")
                 }
 
                 if !loaded.isEmpty {
@@ -489,32 +500,37 @@ class AppState {
                             addLog(.info, "✅ initSystem: \(m.sessionId.prefix(8))，工具=\(m.tools.count)个")
 
                         case .assistant(let msg):
-                            statusText = "助手正在回复..."
+                            // ── 只更新本地缓冲区，不触发任何 @Observable 属性 ──
+                            var pendingLiveActivity: String? = nil
+                            var pendingKind: LiveActivityKind? = nil
+                            var pendingThinking: Bool? = nil
+                            var pendingSnippet: String? = nil
+
                             for content in msg.message.content {
                                 switch content {
                                 case .text(let text, _):
                                     textBuffer = text
                                     if !text.isEmpty {
-                                        liveActivity = "正在生成回复..."
-                                        liveActivityKind = .generating
-                                        isThinking = false
-                                        thinkingSnippet = ""
+                                        pendingLiveActivity = "正在生成回复..."
+                                        pendingKind = .generating
+                                        pendingThinking = false
+                                        pendingSnippet = ""
                                     }
                                 case .thinking(let thinking):
                                     thinkingBuffer = thinking.thinking
-                                    isThinking = true
-                                    liveActivityKind = .thinking
-                                    liveActivity = "深度推理中..."
-                                    // 取最后一行非空内容作为实时片段
+                                    pendingThinking = true
+                                    pendingKind = .thinking
+                                    pendingLiveActivity = "深度推理中..."
+                                    // 取最后一行非空内容作为实时片段（延迟到节流时写入）
                                     let lastLine = thinking.thinking
                                         .components(separatedBy: "\n")
                                         .reversed()
                                         .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
-                                    thinkingSnippet = lastLine.count > 60
+                                    pendingSnippet = lastLine.count > 60
                                         ? String(lastLine.prefix(60)) + "…"
                                         : lastLine
                                 case .toolUse(let tool):
-                                    // 每个新工具 → 独立的 .tool 消息（不混入助手气泡）
+                                    // toolUse 是离散事件，立即写入（不频繁，安全）
                                     if !knownToolIds.contains(tool.id) {
                                         knownToolIds.insert(tool.id)
                                         let toolMsgId = UUID()
@@ -532,9 +548,17 @@ class AppState {
                                 default: break
                                 }
                             }
-                            // 节流：80ms 更新一次文字气泡（仅文字 + 思考）
+
+                            // ── 节流：最多每 120ms 触发一次所有 @Observable 写入 ──
                             let now = Date()
-                            if now.timeIntervalSince(lastUIUpdate) >= 0.08 {
+                            if now.timeIntervalSince(lastUIUpdate) >= 0.12 {
+                                // 批量写入活动状态（单次通知，不多次触发 re-render）
+                                statusText = "助手正在回复..."
+                                if let v = pendingLiveActivity { liveActivity = v }
+                                if let v = pendingKind         { liveActivityKind = v }
+                                if let v = pendingThinking     { isThinking = v }
+                                if let v = pendingSnippet      { thinkingSnippet = v }
+
                                 var assistBlocks: [MessageBlock] = []
                                 if !thinkingBuffer.isEmpty { assistBlocks.append(.thinking(thinkingBuffer)) }
                                 if !textBuffer.isEmpty    { assistBlocks.append(.text(textBuffer)) }
@@ -544,7 +568,6 @@ class AppState {
                             }
 
                         case .user(let msg):
-                            statusText = "工具执行中..."
                             for content in msg.message.content {
                                 if case .toolResult(let result) = content, let tid = result.toolUseId {
                                     let rt: String
@@ -557,6 +580,8 @@ class AppState {
                                         updateToolMessageResult(toolMsgId: toolMsgId, toolId: tid,
                                                                result: rt, in: sessionId)
                                     }
+                                    // 工具结果是离散事件，直接写
+                                    statusText = "工具执行中..."
                                     liveActivity = "工具执行完成，等待回复..."
                                     liveActivityKind = .toolDone
                                 }

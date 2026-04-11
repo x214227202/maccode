@@ -647,11 +647,9 @@ struct ChatView: View {
                     .onChange(of: appState.currentMessages.count) { _, _ in
                         proxy.scrollTo("__bottom__", anchor: .bottom)
                     }
-                    .onChange(of: appState.streamingVersion) { _, _ in
-                        proxy.scrollTo("__bottom__", anchor: .bottom)
-                    }
-                    .onChange(of: appState.isLoading) { _, _ in
-                        proxy.scrollTo("__bottom__", anchor: .bottom)
+                    .onChange(of: appState.isLoading) { _, newVal in
+                        // 生成结束时滚到底，不对每次 streamingVersion 自增都触发（高频滚动会卡顿）
+                        if !newVal { proxy.scrollTo("__bottom__", anchor: .bottom) }
                     }
                 }
             }
@@ -1259,6 +1257,10 @@ struct MarkdownText: View {
 struct ProseView: View {
     let text: String
 
+    // ── 节点缓存：text 不变则不重新解析 ──────────────────
+    @State private var cachedText: String = ""
+    @State private var cachedNodes: [Node] = []
+
     // ── 节点类型 ──────────────────────────────────────────
     private enum Node {
         case heading(level: Int, content: String)
@@ -1377,13 +1379,15 @@ struct ProseView: View {
 
     // ── 渲染 ──────────────────────────────────────────────
     var body: some View {
-        let nodes = parse(text)
+        let nodes = text == cachedText ? cachedNodes : parse(text)
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(nodes.enumerated()), id: \.offset) { idx, node in
                 nodeView(node)
                     .padding(.bottom, bottomPad(nodes, idx))
             }
         }
+        .onAppear { if cachedText != text { cachedText = text; cachedNodes = nodes } }
+        .onChange(of: text) { _, newText in cachedText = newText; cachedNodes = parse(newText) }
     }
 
     private func bottomPad(_ nodes: [Node], _ i: Int) -> CGFloat {
