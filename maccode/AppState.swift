@@ -77,6 +77,9 @@ class AppState {
     var errorMessage: String?
     var isClaudeInstalled: Bool = true
 
+    /// 实时活动描述（工具调用时更新，显示在聊天区底部）
+    var liveActivity: String = ""
+
     /// 每次节流更新 UI 时自增，供 ChatView 触发自动滚动
     var streamingVersion: Int = 0
 
@@ -462,8 +465,10 @@ class AppState {
                                 switch content {
                                 case .text(let text, _):
                                     textBuffer = text
+                                    if !text.isEmpty { liveActivity = "正在生成回复..." }
                                 case .thinking(let thinking):
                                     thinkingBuffer = thinking.thinking
+                                    liveActivity = "思考中..."
                                 case .toolUse(let tool):
                                     // 每个新工具 → 独立的 .tool 消息（不混入助手气泡）
                                     if !knownToolIds.contains(tool.id) {
@@ -474,6 +479,7 @@ class AppState {
                                         let block = ToolCallBlock(toolName: tool.name, args: args, toolId: tool.id)
                                         appendMessage(ChatMessage(id: toolMsgId, role: .tool,
                                                                   blocks: [.toolCall(block)]), to: sessionId)
+                                        liveActivity = toolActivityDescription(tool.name, tool.input)
                                         addLog(.info, "toolUse: \(tool.name)")
                                     }
                                 default: break
@@ -504,6 +510,7 @@ class AppState {
                                         updateToolMessageResult(toolMsgId: toolMsgId, toolId: tid,
                                                                result: rt, in: sessionId)
                                     }
+                                    liveActivity = "工具执行完成，等待回复..."
                                 }
                             }
 
@@ -575,6 +582,7 @@ class AppState {
 
         isLoading = false
         statusText = ""
+        liveActivity = ""
         streamTask = nil
     }
 
@@ -613,6 +621,7 @@ class AppState {
         streamTask = nil
         isLoading = false
         statusText = ""
+        liveActivity = ""
         addLog(.info, "用户取消响应")
     }
 
@@ -712,6 +721,52 @@ class AppState {
         case .null:
             return "null"
         }
+    }
+
+    /// 根据工具名和输入生成简洁的实时活动描述
+    private func toolActivityDescription(_ name: String, _ input: MessageResponse.Content.Input) -> String {
+        func strVal(_ key: String) -> String? {
+            if let v = input[key], case .string(let s) = v { return s }
+            return nil
+        }
+        let shortPath: (String) -> String = { path in
+            // 只取最后两段路径
+            let parts = path.split(separator: "/")
+            if parts.count >= 2 { return parts.suffix(2).joined(separator: "/") }
+            return path
+        }
+        switch name {
+        case "Read":
+            if let p = strVal("file_path") { return "读取文件: \(shortPath(p))" }
+        case "Write":
+            if let p = strVal("file_path") { return "写入文件: \(shortPath(p))" }
+        case "Edit":
+            if let p = strVal("file_path") { return "编辑文件: \(shortPath(p))" }
+        case "MultiEdit":
+            if let p = strVal("file_path") { return "多处编辑: \(shortPath(p))" }
+        case "Bash":
+            if let cmd = strVal("command") {
+                let short = cmd.count > 50 ? String(cmd.prefix(50)) + "…" : cmd
+                return "执行命令: \(short)"
+            }
+        case "Glob":
+            if let pat = strVal("pattern") { return "搜索文件: \(pat)" }
+        case "Grep":
+            if let pat = strVal("pattern") { return "搜索内容: \(pat)" }
+        case "WebFetch":
+            if let url = strVal("url") {
+                let short = url.count > 60 ? String(url.prefix(60)) + "…" : url
+                return "获取网页: \(short)"
+            }
+        case "WebSearch":
+            if let q = strVal("query") { return "搜索: \(q)" }
+        case "TodoWrite":
+            return "更新任务列表"
+        case "Task":
+            return "启动子任务..."
+        default: break
+        }
+        return "调用 \(name)..."
     }
 
     private func removeMessage(_ id: UUID, from sessionId: UUID) {

@@ -651,19 +651,104 @@ struct ChatView: View {
                     .onChange(of: appState.streamingVersion) { _, _ in
                         proxy.scrollTo("__bottom__", anchor: .bottom)
                     }
+                    .onChange(of: appState.isLoading) { _, _ in
+                        proxy.scrollTo("__bottom__", anchor: .bottom)
+                    }
                 }
+            }
+
+            // 实时活动状态条
+            if appState.isLoading {
+                LiveActivityBar(activity: appState.liveActivity, statusText: appState.statusText)
+                    .padding(.horizontal, 80)
+                    .padding(.top, 4)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
             // 输入框
             AgentInputView()
                 .padding(.horizontal, 80)
-                .padding(.top, 6)
+                .padding(.top, 4)
                 .padding(.bottom, 14)
         }
         .inspector(isPresented: $showFiles) {
             FilesPanel(showFiles: $showFiles, session: appState.selectedSession)
                 .inspectorColumnWidth(min: 200, ideal: 250, max: 300)
         }
+    }
+}
+
+// MARK: - 实时活动状态条
+
+struct LiveActivityBar: View {
+    let activity: String
+    let statusText: String
+
+    @State private var pulse = false
+    @State private var dotPhase: Int = 0
+    @State private var displayText: String = ""
+
+    private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // 动态脉冲圆点
+            ZStack {
+                Circle()
+                    .fill(Color.blue.opacity(0.18))
+                    .frame(width: 22, height: 22)
+                    .scaleEffect(pulse ? 1.25 : 1.0)
+                Circle()
+                    .fill(
+                        LinearGradient(colors: [Color(red:0.3,green:0.6,blue:1.0),
+                                                Color(red:0.15,green:0.45,blue:0.9)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing)
+                    )
+                    .frame(width: 8, height: 8)
+            }
+            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: pulse)
+
+            // 活动文字
+            let shown = activity.isEmpty ? (statusText.isEmpty ? "Claude 正在处理..." : statusText) : activity
+            Text(shown + dots)
+                .font(.system(size: 12, weight: .medium, design: .default))
+                .foregroundColor(.primary.opacity(0.75))
+                .lineLimit(1)
+                .animation(.easeInOut(duration: 0.2), value: shown)
+
+            Spacer()
+
+            // 闪烁的 AI 标识
+            Text("AI")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundColor(.blue.opacity(0.55))
+                .padding(.horizontal, 5).padding(.vertical, 2)
+                .background(Color.blue.opacity(0.08))
+                .cornerRadius(4)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(
+                            LinearGradient(
+                                colors: [Color.blue.opacity(0.30), Color.blue.opacity(0.10)],
+                                startPoint: .leading, endPoint: .trailing
+                            ),
+                            lineWidth: 1
+                        )
+                )
+        )
+        .onAppear { pulse = true }
+        .onReceive(timer) { _ in
+            dotPhase = (dotPhase + 1) % 4
+        }
+    }
+
+    private var dots: String {
+        String(repeating: ".", count: dotPhase)
     }
 }
 
