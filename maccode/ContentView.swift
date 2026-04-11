@@ -614,14 +614,12 @@ struct ChatView: View {
                             }
                             // 流式阶段：独立气泡，只有此 View 随 streamingText 变化重渲
                             // messagesBySession 不修改 → 历史消息列表完全稳定
+                            // ScrollDriver 独立 View 隔离 streamingText 订阅，
+                            // ChatView.body 本身不读 streamingText → 不会因每帧文字变化而重 compute
                             if appState.isStreaming {
                                 StreamingAssistantBubble()
                                     .id("streaming-bubble")
-                                // 滚动驱动：读 streamingText → 随文字增长追底
-                                Color.clear.frame(height: 0)
-                                    .onChange(of: appState.streamingText) { _, _ in
-                                        proxy.scrollTo("__bottom__", anchor: .bottom)
-                                    }
+                                StreamingScrollDriver(proxy: proxy)
                             }
                             Color.clear.frame(height: 1).id("__bottom__")
                         }
@@ -661,6 +659,22 @@ struct ChatView: View {
             FilesPanel(showFiles: $showFiles, session: appState.selectedSession)
                 .inspectorColumnWidth(min: 200, ideal: 250, max: 300)
         }
+    }
+}
+
+// MARK: - 流式滚动驱动（独立 View，隔离 streamingText 订阅，不污染 ChatView.body）
+// ChatView.body 不读 streamingText → 每帧文字变化时 ChatView.body 不重 compute
+// 只有此 View + StreamingAssistantBubble 重渲
+
+private struct StreamingScrollDriver: View {
+    @Environment(AppState.self) var appState
+    let proxy: ScrollViewProxy
+
+    var body: some View {
+        Color.clear.frame(height: 0)
+            .onChange(of: appState.streamingText) { _, _ in
+                proxy.scrollTo("__bottom__", anchor: .bottom)
+            }
     }
 }
 
