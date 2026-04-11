@@ -27,6 +27,7 @@ struct ToolCallBlock: Identifiable {
 enum MessageBlock {
     case text(String)
     case toolCall(ToolCallBlock)
+    case thinking(String)
 }
 
 struct ChatMessage: Identifiable {
@@ -58,14 +59,6 @@ struct Project: Identifiable, Codable {
 }
 
 // MARK: - 文件树
-
-struct FileNode: Identifiable {
-    let id = UUID()
-    var name: String
-    var isDir: Bool
-    var depth: Int
-    var isModified: Bool = false
-}
 
 // MARK: - 主视图
 
@@ -797,6 +790,8 @@ struct ChatMessageView: View {
                             }
                         case .toolCall(let tc):
                             ToolCallView(tool: tc)
+                        case .thinking(let t):
+                            ThinkingBlockView(text: t)
                         }
                     }
                 }
@@ -818,6 +813,8 @@ struct ChatMessageView: View {
                             }
                         case .toolCall(let tc):
                             ToolCallView(tool: tc)
+                        case .thinking(let t):
+                            ThinkingBlockView(text: t)
                         }
                     }
                 }
@@ -918,6 +915,55 @@ struct ToolCallView: View {
 struct MarkdownText: View {
     let text: String
 
+    enum TextSegment { case prose(String); case code(String, language: String) }
+
+    var segments: [TextSegment] {
+        var result: [TextSegment] = []
+        let lines = text.components(separatedBy: "\n")
+        var i = 0
+        var proseBuf: [String] = []
+        while i < lines.count {
+            let line = lines[i]
+            if line.hasPrefix("```") {
+                if !proseBuf.isEmpty {
+                    result.append(.prose(proseBuf.joined(separator: "\n")))
+                    proseBuf = []
+                }
+                let lang = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                i += 1
+                var codeLines: [String] = []
+                while i < lines.count && !lines[i].hasPrefix("```") {
+                    codeLines.append(lines[i])
+                    i += 1
+                }
+                if i < lines.count { i += 1 }
+                result.append(.code(codeLines.joined(separator: "\n"), language: lang))
+            } else {
+                proseBuf.append(line)
+                i += 1
+            }
+        }
+        if !proseBuf.isEmpty { result.append(.prose(proseBuf.joined(separator: "\n"))) }
+        return result
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                switch seg {
+                case .prose(let t): ProseView(text: t)
+                case .code(let code, let lang): CodeBlockView(code: code, language: lang)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Prose（行内 Markdown）
+
+struct ProseView: View {
+    let text: String
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             ForEach(Array(text.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
@@ -926,6 +972,12 @@ struct MarkdownText: View {
                         Text("•").foregroundColor(.secondary)
                         renderedLine(Substring(line.dropFirst(2)))
                     }
+                } else if line.hasPrefix("# ") {
+                    renderedLine(Substring(line.dropFirst(2))).bold().font(.system(size: 15))
+                } else if line.hasPrefix("## ") {
+                    renderedLine(Substring(line.dropFirst(3))).bold().font(.system(size: 14))
+                } else if line.hasPrefix("### ") {
+                    renderedLine(Substring(line.dropFirst(4))).bold().font(.system(size: 13))
                 } else if !line.isEmpty {
                     renderedLine(Substring(line))
                 } else {
@@ -936,7 +988,7 @@ struct MarkdownText: View {
     }
 
     func renderedLine(_ raw: Substring) -> Text {
-        segments(String(raw)).reduce(Text("")) { acc, seg in
+        inlineSegs(String(raw)).reduce(Text("")) { acc, seg in
             if seg.isBold {
                 return acc + Text(seg.text).bold()
             } else if seg.isCode {
@@ -951,7 +1003,7 @@ struct MarkdownText: View {
 
     struct Seg { var text: String; var isBold = false; var isCode = false }
 
-    func segments(_ s: String) -> [Seg] {
+    func inlineSegs(_ s: String) -> [Seg] {
         var out: [Seg] = []
         var cur = ""
         var i = s.startIndex
@@ -976,6 +1028,106 @@ struct MarkdownText: View {
         }
         if !cur.isEmpty { out.append(Seg(text: cur)) }
         return out
+    }
+}
+
+// MARK: - 代码块视图
+
+struct CodeBlockView: View {
+    let code: String
+    let language: String
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // 语言标头 + 复制按钮
+            HStack {
+                Text(language.isEmpty ? "代码" : language)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundColor(.secondary.opacity(0.55))
+                Spacer()
+                Button(action: copyCode) {
+                    HStack(spacing: 3) {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 9))
+                        Text(copied ? "已复制" : "复制")
+                            .font(.system(size: 10))
+                    }
+                    .foregroundColor(.secondary.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(Color.white.opacity(0.04))
+
+            Divider().opacity(0.12)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(size: 11.5, design: .monospaced))
+                    .foregroundColor(.primary.opacity(0.88))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+            }
+        }
+        .background(Color.black.opacity(0.32))
+        .cornerRadius(8)
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.08), lineWidth: 1))
+    }
+
+    func copyCode() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+    }
+}
+
+// MARK: - 思考过程块
+
+struct ThinkingBlockView: View {
+    let text: String
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } }) {
+                HStack(spacing: 7) {
+                    Image(systemName: "brain.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.purple.opacity(0.75))
+                    Text("思考过程")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.purple.opacity(0.7))
+                    Text("(\(text.count) 字)")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary.opacity(0.45))
+                    Spacer()
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary.opacity(0.5))
+                }
+                .padding(.horizontal, 10).padding(.vertical, 7)
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                Divider().opacity(0.15).padding(.horizontal, 10)
+                ScrollView {
+                    Text(text)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundColor(.secondary.opacity(0.75))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                }
+                .frame(maxHeight: 220)
+            }
+        }
+        .background(Color.purple.opacity(0.07))
+        .cornerRadius(7)
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.purple.opacity(0.18), lineWidth: 1))
     }
 }
 
@@ -1157,22 +1309,42 @@ struct FileItem: Identifiable {
     let name: String
     let isDirectory: Bool
     let path: String
+    var depth: Int = 0
 }
 
 struct FilesPanel: View {
     @Binding var showFiles: Bool
     let session: AgentSession?
     @State private var searchText = ""
-    @State private var fileItems: [FileItem] = []
-    @State private var isLoading = false
+    @State private var rootItems: [FileItem] = []
+    @State private var expandedPaths: Set<String> = []
+    @State private var childrenByPath: [String: [FileItem]] = [:]
+    @State private var loadingPaths: Set<String> = []
+    @State private var isLoadingRoot = false
     @State private var loadError: String? = nil
 
-    var filteredItems: [FileItem] {
-        guard !searchText.isEmpty else { return fileItems }
-        return fileItems.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    var currentDir: String? { session?.workingDirectory }
+
+    // 递归构建当前可见的扁平列表
+    func buildVisible(_ items: [FileItem]) -> [FileItem] {
+        var result: [FileItem] = []
+        for item in items {
+            result.append(item)
+            if item.isDirectory && expandedPaths.contains(item.path) {
+                if let children = childrenByPath[item.path] {
+                    result.append(contentsOf: buildVisible(children))
+                }
+            }
+        }
+        return result
     }
 
-    var currentDir: String? { session?.workingDirectory }
+    var visibleItems: [FileItem] { buildVisible(rootItems) }
+
+    var filteredItems: [FileItem] {
+        guard !searchText.isEmpty else { return visibleItems }
+        return visibleItems.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1197,11 +1369,10 @@ struct FilesPanel: View {
                         .padding(.horizontal, 6).padding(.vertical, 3)
                         .background(Color.white.opacity(0.06))
                         .cornerRadius(5)
-                        .help(dir)         // hover 显示完整路径
+                        .help(dir)
                 }
-                // 刷新按钮
                 if currentDir != nil {
-                    Button(action: { if let d = currentDir { loadFiles(from: d) } }) {
+                    Button(action: { reloadRoot() }) {
                         Image(systemName: "arrow.clockwise")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary.opacity(0.5))
@@ -1220,6 +1391,13 @@ struct FilesPanel: View {
                 TextField("过滤文件...", text: $searchText)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11))
+                if !searchText.isEmpty {
+                    Button(action: { searchText = "" }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary.opacity(0.4))
+                    }.buttonStyle(.plain)
+                }
             }
             .padding(.horizontal, 8).padding(.vertical, 4)
             .background(Color.white.opacity(0.05)).cornerRadius(5)
@@ -1228,7 +1406,7 @@ struct FilesPanel: View {
             Divider().opacity(0.2)
 
             if let dir = currentDir {
-                if isLoading {
+                if isLoadingRoot {
                     Spacer()
                     ProgressView().scaleEffect(0.7)
                     Spacer()
@@ -1236,38 +1414,36 @@ struct FilesPanel: View {
                     VStack(spacing: 6) {
                         Spacer()
                         Image(systemName: "exclamationmark.triangle")
-                            .font(.system(size: 20))
-                            .foregroundColor(.orange.opacity(0.6))
-                        Text(err)
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary.opacity(0.6))
+                            .font(.system(size: 20)).foregroundColor(.orange.opacity(0.6))
+                        Text(err).font(.system(size: 11)).foregroundColor(.secondary.opacity(0.6))
                             .multilineTextAlignment(.center)
                         Spacer()
                     }.padding(.horizontal, 12)
                 } else if filteredItems.isEmpty && !searchText.isEmpty {
                     VStack {
                         Spacer()
-                        Text("无匹配文件")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary.opacity(0.4))
+                        Text("无匹配文件").font(.system(size: 11)).foregroundColor(.secondary.opacity(0.4))
                         Spacer()
                     }
-                } else if fileItems.isEmpty {
+                } else if rootItems.isEmpty {
                     VStack(spacing: 6) {
                         Spacer()
                         Image(systemName: "doc.badge.ellipsis")
-                            .font(.system(size: 22))
-                            .foregroundColor(.secondary.opacity(0.25))
-                        Text("目录为空")
-                            .font(.system(size: 11))
-                            .foregroundColor(.secondary.opacity(0.4))
+                            .font(.system(size: 22)).foregroundColor(.secondary.opacity(0.25))
+                        Text("目录为空").font(.system(size: 11)).foregroundColor(.secondary.opacity(0.4))
                         Spacer()
                     }
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 0) {
                             ForEach(filteredItems) { item in
-                                FileItemRow(item: item, rootDir: dir)
+                                FileItemRow(
+                                    item: item,
+                                    rootDir: dir,
+                                    isExpanded: expandedPaths.contains(item.path),
+                                    isLoadingChildren: loadingPaths.contains(item.path),
+                                    onToggle: { toggleDirectory(item) }
+                                )
                             }
                         }
                     }
@@ -1276,72 +1452,111 @@ struct FilesPanel: View {
                 VStack(spacing: 8) {
                     Spacer()
                     Image(systemName: "folder.badge.questionmark")
-                        .font(.system(size: 24))
-                        .foregroundColor(.secondary.opacity(0.4))
+                        .font(.system(size: 24)).foregroundColor(.secondary.opacity(0.4))
                     Text("未选择工作目录")
-                        .font(.system(size: 12))
-                        .foregroundColor(.secondary.opacity(0.6))
+                        .font(.system(size: 12)).foregroundColor(.secondary.opacity(0.6))
                     Spacer()
                 }
             }
         }
         .onChange(of: currentDir) { _, newDir in
-            fileItems = []
-            loadError = nil
-            if let dir = newDir { loadFiles(from: dir) }
+            resetTree()
+            if let dir = newDir { loadRootItems(from: dir) }
         }
         .onAppear {
-            if let dir = currentDir { loadFiles(from: dir) }
+            if let dir = currentDir { loadRootItems(from: dir) }
         }
     }
 
-    func loadFiles(from dir: String) {
-        isLoading = true
+    func reloadRoot() {
+        resetTree()
+        if let dir = currentDir { loadRootItems(from: dir) }
+    }
+
+    func resetTree() {
+        rootItems = []
+        expandedPaths = []
+        childrenByPath = [:]
+        loadingPaths = []
+        loadError = nil
+    }
+
+    func toggleDirectory(_ item: FileItem) {
+        guard item.isDirectory else { return }
+        if expandedPaths.contains(item.path) {
+            // 折叠：移除该目录及其所有子目录
+            let prefix = item.path + "/"
+            expandedPaths = expandedPaths.filter { $0 != item.path && !$0.hasPrefix(prefix) }
+        } else {
+            expandedPaths.insert(item.path)
+            if childrenByPath[item.path] == nil && !loadingPaths.contains(item.path) {
+                loadChildren(of: item)
+            }
+        }
+    }
+
+    func loadChildren(of parent: FileItem) {
+        loadingPaths.insert(parent.path)
+        let depth = parent.depth + 1
+        let path = parent.path
+        DispatchQueue.global(qos: .userInitiated).async {
+            let items = loadDirItems(path, depth: depth)
+            DispatchQueue.main.async {
+                self.childrenByPath[path] = items
+                self.loadingPaths.remove(path)
+            }
+        }
+    }
+
+    func loadRootItems(from dir: String) {
+        isLoadingRoot = true
         loadError = nil
         DispatchQueue.global(qos: .userInitiated).async {
             let fm = FileManager.default
             var isDir: ObjCBool = false
             guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else {
                 DispatchQueue.main.async {
-                    self.isLoading = false
+                    self.isLoadingRoot = false
                     self.loadError = "路径不存在或不是目录"
                 }
                 return
             }
-            do {
-                let names = try fm.contentsOfDirectory(atPath: dir)
-                let items = names
-                    .filter { !$0.hasPrefix(".") }
-                    .map { name -> FileItem in
-                        let path = (dir as NSString).appendingPathComponent(name)
-                        var d: ObjCBool = false
-                        fm.fileExists(atPath: path, isDirectory: &d)
-                        return FileItem(name: name, isDirectory: d.boolValue, path: path)
-                    }
-                    .sorted { a, b in
-                        if a.isDirectory != b.isDirectory { return a.isDirectory }
-                        return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
-                    }
-                DispatchQueue.main.async {
-                    self.fileItems = items
-                    self.isLoading = false
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.isLoading = false
-                    self.loadError = "读取失败：\(error.localizedDescription)"
-                }
+            let items = loadDirItems(dir, depth: 0)
+            DispatchQueue.main.async {
+                self.rootItems = items
+                self.isLoadingRoot = false
             }
         }
     }
 }
 
+// 从磁盘读取目录内容（可在后台线程调用）
+private func loadDirItems(_ dir: String, depth: Int) -> [FileItem] {
+    let fm = FileManager.default
+    guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
+    return names
+        .filter { !$0.hasPrefix(".") }
+        .map { name -> FileItem in
+            let path = (dir as NSString).appendingPathComponent(name)
+            var d: ObjCBool = false
+            fm.fileExists(atPath: path, isDirectory: &d)
+            return FileItem(name: name, isDirectory: d.boolValue, path: path, depth: depth)
+        }
+        .sorted { a, b in
+            if a.isDirectory != b.isDirectory { return a.isDirectory }
+            return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+        }
+}
+
 struct FileItemRow: View {
     let item: FileItem
     let rootDir: String
+    let isExpanded: Bool
+    let isLoadingChildren: Bool
+    let onToggle: () -> Void
 
-    var icon: String {
-        if item.isDirectory { return "folder" }
+    var fileIcon: String {
+        if item.isDirectory { return isExpanded ? "folder.fill" : "folder" }
         let ext = (item.name as NSString).pathExtension.lowercased()
         switch ext {
         case "swift": return "swift"
@@ -1356,7 +1571,7 @@ struct FileItemRow: View {
     }
 
     var iconColor: Color {
-        if item.isDirectory { return .blue.opacity(0.75) }
+        if item.isDirectory { return .blue.opacity(isExpanded ? 0.95 : 0.75) }
         let ext = (item.name as NSString).pathExtension.lowercased()
         switch ext {
         case "swift": return .orange
@@ -1369,22 +1584,62 @@ struct FileItemRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 7) {
-            Image(systemName: icon)
+        HStack(spacing: 0) {
+            // 缩进
+            Spacer().frame(width: CGFloat(item.depth) * 14 + 4)
+
+            // 目录展开/折叠按钮
+            if item.isDirectory {
+                Button(action: onToggle) {
+                    Group {
+                        if isLoadingChildren {
+                            ProgressView().scaleEffect(0.45)
+                        } else {
+                            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundColor(.secondary.opacity(0.55))
+                        }
+                    }
+                    .frame(width: 14, height: 14)
+                }
+                .buttonStyle(.plain)
+            } else {
+                Spacer().frame(width: 14)
+            }
+
+            Spacer().frame(width: 4)
+
+            Image(systemName: fileIcon)
                 .font(.system(size: 11))
                 .foregroundColor(iconColor)
                 .frame(width: 14)
+
+            Spacer().frame(width: 5)
+
             Text(item.name)
                 .font(.system(size: 12))
-                .foregroundColor(item.isDirectory ? .primary.opacity(0.85) : .primary.opacity(0.7))
+                .foregroundColor(item.isDirectory ? .primary.opacity(0.85) : .primary.opacity(0.72))
                 .lineLimit(1)
+
             Spacer()
         }
-        .padding(.horizontal, 12).padding(.vertical, 5)
+        .padding(.vertical, 5)
         .contentShape(Rectangle())
         .onTapGesture {
-            if !item.isDirectory {
+            if item.isDirectory {
+                onToggle()
+            } else {
                 NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: rootDir)
+            }
+        }
+        .contextMenu {
+            Button("在 Finder 中显示") {
+                NSWorkspace.shared.selectFile(item.path, inFileViewerRootedAtPath: "")
+            }
+            if !item.isDirectory {
+                Button("用默认程序打开") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
+                }
             }
         }
     }

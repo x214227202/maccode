@@ -436,8 +436,20 @@ class AppState {
                 // 使用 for await 在 @MainActor 上直接迭代，无需 Combine sink + MainActor.assumeIsolated
                 addLog(.info, "stream publisher 已获得，开始 for await 迭代...")
                 var textBuffer = ""
+                var thinkingBuffer = ""
                 var toolBlocks: [ToolCallBlock] = []
                 var capturedSid: String? = nil
+
+                // 构建当前 blocks 的辅助函数
+                func buildBlocks(finalText: String? = nil) -> [MessageBlock] {
+                    var blocks: [MessageBlock] = []
+                    if !thinkingBuffer.isEmpty { blocks.append(.thinking(thinkingBuffer)) }
+                    let t = finalText ?? textBuffer
+                    if !t.isEmpty { blocks.append(.text(t)) }
+                    for tc in toolBlocks { blocks.append(.toolCall(tc)) }
+                    if blocks.isEmpty { blocks = [.text("")] }
+                    return blocks
+                }
 
                 do {
                     for try await chunk in publisher.values {
@@ -458,20 +470,23 @@ class AppState {
                                 case .text(let text, _):
                                     textBuffer = text
                                     addLog(.debug, "  → text \(text.count)字：[\(text.prefix(60))]")
+                                case .thinking(let thinking):
+                                    thinkingBuffer = thinking.thinking
+                                    addLog(.debug, "  → thinking \(thinking.thinking.count)字")
                                 case .toolUse(let tool):
                                     if !toolBlocks.contains(where: { $0.toolId == tool.id }) {
                                         let args = jsonDescription(tool.input)
                                         toolBlocks.append(ToolCallBlock(toolName: tool.name, args: args, toolId: tool.id))
                                         addLog(.debug, "  → toolUse: \(tool.name)")
                                     }
+                                case .serverToolUse(let tool):
+                                    addLog(.debug, "  → serverToolUse: \(tool.name)")
+                                case .webSearchToolResult(let r):
+                                    addLog(.debug, "  → webSearch: \(r.content.count) 条结果")
                                 default: break
                                 }
                             }
-                            var blocks: [MessageBlock] = []
-                            if !textBuffer.isEmpty { blocks.append(.text(textBuffer)) }
-                            for t in toolBlocks { blocks.append(.toolCall(t)) }
-                            if blocks.isEmpty { blocks = [.text("")] }
-                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: blocks)
+                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: buildBlocks())
 
                         case .user(let msg):
                             statusText = "工具执行中..."
@@ -489,14 +504,13 @@ class AppState {
 
                         case .result(let m):
                             addLog(.info, "✅ result: cost=$\(m.totalCostUsd) turns=\(m.numTurns) text=\(m.result?.count ?? 0)字")
-                            if let finalText = m.result, !finalText.isEmpty {
-                                textBuffer = finalText
+                            let finalText = m.result?.isEmpty == false ? m.result : nil
+                            var finalBlocks = buildBlocks(finalText: finalText)
+                            // 最终无内容时兜底
+                            if finalBlocks.count == 1, case .text(let t) = finalBlocks[0], t.isEmpty {
+                                finalBlocks = [.text("（操作完成）")]
                             }
-                            var blocks: [MessageBlock] = []
-                            if !textBuffer.isEmpty { blocks.append(.text(textBuffer)) }
-                            for t in toolBlocks { blocks.append(.toolCall(t)) }
-                            if blocks.isEmpty { blocks = [.text("（操作完成）")] }
-                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: blocks)
+                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: finalBlocks)
                             let cost = String(format: "%.4f", m.totalCostUsd)
                             if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
                                 sessions[idx].sdkSessionId = capturedSid ?? m.sessionId
