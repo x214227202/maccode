@@ -87,8 +87,13 @@ class AppState {
     enum LiveActivityKind { case connecting, thinking, toolUse, generating, toolDone }
     var liveActivityKind: LiveActivityKind = .connecting
 
-    /// 每次节流更新 UI 时自增，供 ChatView 触发自动滚动
-    var streamingVersion: Int = 0
+    // MARK: 流式独立缓冲区（避免每帧写 messagesBySession 引发整列重渲）
+    /// 当前是否有助手消息正在流式输出（替代 messagesBySession 中的空占位）
+    var isStreaming: Bool = false
+    /// 流式阶段的正文内容（只更新此属性，不写 messagesBySession）
+    var streamingText: String = ""
+    /// 流式阶段的思考内容
+    var streamingThinking: String = ""
 
     // MARK: 调试日志（最新 200 条）
     var debugLogs: [DebugLogEntry] = []
@@ -485,7 +490,7 @@ class AppState {
         options.maxTurns = settings.maxTurns
 
         let assistantMsgId = UUID()
-        appendMessage(ChatMessage(id: assistantMsgId, role: .assistant, blocks: [.text("")]), to: sessionId)
+        // 不预先 append 空占位；流式内容通过 streamingText 独立显示
 
         do {
             // 使用 streamJson 格式：通过 .assistant chunk 实时获取文本和工具调用
@@ -519,6 +524,11 @@ class AppState {
                 // clui-cc 模式：每个工具调用 = 独立消息，用 toolId 追踪
                 var knownToolIds: Set<String> = []
                 var toolMsgIdByToolId: [String: UUID] = [:]
+
+                // 进入流式阶段：独立缓冲区接管，不写 messagesBySession
+                isStreaming = true
+                streamingText = ""
+                streamingThinking = ""
 
                 do {
                     for try await chunk in publisher.values {
@@ -584,20 +594,18 @@ class AppState {
                             }
 
                             // ── 节流：最多每 120ms 触发一次所有 @Observable 写入 ──
+                            // 关键：只更新 streamingText/streamingThinking，
+                            // 不碰 messagesBySession → 历史消息列表不重渲
                             let now = Date()
                             if now.timeIntervalSince(lastUIUpdate) >= 0.12 {
-                                // 批量写入活动状态（单次通知，不多次触发 re-render）
                                 statusText = "助手正在回复..."
                                 if let v = pendingLiveActivity { liveActivity = v }
                                 if let v = pendingKind         { liveActivityKind = v }
                                 if let v = pendingThinking     { isThinking = v }
                                 if let v = pendingSnippet      { thinkingSnippet = v }
-
-                                var assistBlocks: [MessageBlock] = []
-                                if !thinkingBuffer.isEmpty { assistBlocks.append(.thinking(thinkingBuffer)) }
-                                if !textBuffer.isEmpty    { assistBlocks.append(.text(textBuffer)) }
-                                if assistBlocks.isEmpty   { assistBlocks = [.text("")] }
-                                updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: assistBlocks)
+                                // 只写独立流式缓冲区，StreamingAssistantBubble 单独重渲
+                                streamingText = textBuffer
+                                streamingThinking = thinkingBuffer
                                 lastUIUpdate = now
                             }
 
@@ -623,13 +631,18 @@ class AppState {
 
                         case .result(let m):
                             addLog(.info, "✅ result: cost=$\(m.totalCostUsd) turns=\(m.numTurns)")
-                            // 强制最终刷新助手文字（不受节流）
+                            // 流式结束：一次性将完整内容写入 messagesBySession（只触发一次重渲）
                             let finalText = (m.result?.isEmpty == false) ? m.result! : textBuffer
                             var finalBlocks: [MessageBlock] = []
                             if !thinkingBuffer.isEmpty { finalBlocks.append(.thinking(thinkingBuffer)) }
                             if !finalText.isEmpty      { finalBlocks.append(.text(finalText)) }
                             if finalBlocks.isEmpty     { finalBlocks = [.text("（操作完成）")] }
-                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: finalBlocks)
+                            // 先关闭流式气泡，再 append 最终消息（避免两者同时显示）
+                            isStreaming = false
+                            streamingText = ""
+                            streamingThinking = ""
+                            appendMessage(ChatMessage(id: assistantMsgId, role: .assistant, blocks: finalBlocks),
+                                          to: sessionId)
                             let cost = String(format: "%.4f", m.totalCostUsd)
                             if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
                                 sessions[idx].sdkSessionId = capturedSid ?? m.sessionId
@@ -646,14 +659,18 @@ class AppState {
                 } catch {
                     addLog(.error, "stream 迭代出错：\(error)")
                     errorMessage = "请求出错：\(error.localizedDescription)"
-                    removeMessage(assistantMsgId, from: sessionId)
+                    // stream 从未写入 messagesBySession，无需 removeMessage
+                    isStreaming = false
+                    streamingText = ""
+                    streamingThinking = ""
                 }
 
             case .json(let msg):
-                // 兼容：json 格式直接取 result 字段
+                // 兼容：json 格式直接取 result 字段（非流式，直接一次写入）
                 let text = msg.result?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                updateAssistantBlocks(assistantMsgId, in: sessionId,
-                                      blocks: [.text(text.isEmpty ? "（操作完成）" : text)])
+                let jsonBlocks: [MessageBlock] = [.text(text.isEmpty ? "（操作完成）" : text)]
+                appendMessage(ChatMessage(id: assistantMsgId, role: .assistant, blocks: jsonBlocks),
+                              to: sessionId)
                 let cost = String(format: "%.4f", msg.totalCostUsd)
                 if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
                     sessions[idx].sdkSessionId = msg.sessionId
@@ -663,12 +680,13 @@ class AppState {
                 addLog(.info, "json 完成，text 长度=\(text.count)")
 
             case .text(let text):
-                updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: [.text(text)])
+                appendMessage(ChatMessage(id: assistantMsgId, role: .assistant, blocks: [.text(text)]),
+                              to: sessionId)
                 addLog(.info, "收到 text 响应，长度=\(text.count)")
             }
 
         } catch let error as ClaudeCodeError {
-            removeMessage(assistantMsgId, from: sessionId)
+            // 连接阶段就失败了，从未写入任何消息，无需 removeMessage
             addLog(.error, "ClaudeCodeError：\(error)")
             switch error {
             case .notInstalled:
@@ -684,7 +702,6 @@ class AppState {
                 errorMessage = error.localizedDescription
             }
         } catch {
-            removeMessage(assistantMsgId, from: sessionId)
             if !Task.isCancelled {
                 addLog(.error, "未知错误：\(error)")
                 errorMessage = "请求失败：\(error.localizedDescription)"
@@ -692,6 +709,9 @@ class AppState {
         }
 
         isLoading = false
+        isStreaming = false
+        streamingText = ""
+        streamingThinking = ""
         statusText = ""
         liveActivity = ""
         isThinking = false
@@ -734,6 +754,9 @@ class AppState {
         streamTask?.cancel()
         streamTask = nil
         isLoading = false
+        isStreaming = false
+        streamingText = ""
+        streamingThinking = ""
         statusText = ""
         liveActivity = ""
         isThinking = false
@@ -795,14 +818,6 @@ class AppState {
         messagesBySession[sessionId] = msgs          // 显式赋值
     }
 
-    private func updateAssistantBlocks(_ id: UUID, in sessionId: UUID, blocks: [MessageBlock]) {
-        guard var msgs = messagesBySession[sessionId],
-              let idx = msgs.firstIndex(where: { $0.id == id }) else { return }
-        msgs[idx].blocks = blocks
-        messagesBySession[sessionId] = msgs          // 显式赋值
-        streamingVersion &+= 1                        // 通知 ChatView 滚动
-    }
-
     /// 精确更新工具消息的结果（通过 toolMsgId 直接定位，O(n) 不做全局搜索）
     private func updateToolMessageResult(toolMsgId: UUID, toolId: String, result: String, in sessionId: UUID) {
         guard var msgs = messagesBySession[sessionId],
@@ -815,7 +830,6 @@ class AppState {
             return block
         }
         messagesBySession[sessionId] = msgs
-        streamingVersion &+= 1
     }
 
     /// 将工具输入字典转换为可读字符串

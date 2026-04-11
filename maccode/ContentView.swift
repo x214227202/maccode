@@ -612,32 +612,22 @@ struct ChatView: View {
                                 ChatMessageView(message: msg)
                                     .id(msg.id)
                             }
-                            // 极短暂出现：用户消息已加，助手占位尚未添加时
-                            if appState.isLoading && appState.currentMessages.last?.role == .user {
-                                HStack(alignment: .top, spacing: 10) {
-                                    RoundedRectangle(cornerRadius: 7)
-                                        .fill(claudeAvatarGradient)
-                                        .frame(width: 26, height: 26)
-                                        .overlay(Image(systemName: "asterisk")
-                                            .font(.system(size: 14, weight: .bold)).foregroundColor(.white))
-                                        .padding(.top, 3)
-                                    StreamingDotsView()
-                                        .padding(.horizontal, 18).padding(.vertical, 14)
-                                        .clipShape(RoundedRectangle(cornerRadius: 16))
-                                        .overlay(RoundedRectangle(cornerRadius: 16)
-                                            .stroke(assistBubbleBorder, lineWidth: 1))
-                                    Spacer(minLength: 52)
-                                }
-                                .padding(.bottom, 16)
-                                .id("streaming-placeholder")
+                            // 流式阶段：独立气泡，只有此 View 随 streamingText 变化重渲
+                            // messagesBySession 不修改 → 历史消息列表完全稳定
+                            if appState.isStreaming {
+                                StreamingAssistantBubble()
+                                    .id("streaming-bubble")
+                                // 滚动驱动：读 streamingText → 随文字增长追底
+                                Color.clear.frame(height: 0)
+                                    .onChange(of: appState.streamingText) { _, _ in
+                                        proxy.scrollTo("__bottom__", anchor: .bottom)
+                                    }
                             }
-                            // 底部锚点，用于滚动定位
                             Color.clear.frame(height: 1).id("__bottom__")
                         }
                         .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 8)
                     }
                     .scrollIndicators(.hidden)
-                    // 切换会话时立刻滚到底部
                     .onAppear {
                         proxy.scrollTo("__bottom__", anchor: .bottom)
                     }
@@ -648,7 +638,6 @@ struct ChatView: View {
                         proxy.scrollTo("__bottom__", anchor: .bottom)
                     }
                     .onChange(of: appState.isLoading) { _, newVal in
-                        // 生成结束时滚到底，不对每次 streamingVersion 自增都触发（高频滚动会卡顿）
                         if !newVal { proxy.scrollTo("__bottom__", anchor: .bottom) }
                     }
                 }
@@ -672,6 +661,60 @@ struct ChatView: View {
             FilesPanel(showFiles: $showFiles, session: appState.selectedSession)
                 .inspectorColumnWidth(min: 200, ideal: 250, max: 300)
         }
+    }
+}
+
+// MARK: - 流式助手气泡（独立 View，随 streamingText 重渲，不影响历史消息列表）
+
+struct StreamingAssistantBubble: View {
+    @Environment(AppState.self) var appState
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            // Claude 头像
+            RoundedRectangle(cornerRadius: 7)
+                .fill(claudeAvatarGradient)
+                .frame(width: 26, height: 26)
+                .overlay(
+                    Image(systemName: "asterisk")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white)
+                )
+                .padding(.top, 3)
+
+            Group {
+                let hasThinking = !appState.streamingThinking.isEmpty
+                let hasText     = !appState.streamingText.isEmpty
+
+                if !hasThinking && !hasText {
+                    // 连接中：跳动动画
+                    StreamingDotsView()
+                        .padding(.horizontal, 18).padding(.vertical, 14)
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if hasThinking {
+                            ThinkingBlockView(text: appState.streamingThinking)
+                        }
+                        if hasText {
+                            MarkdownText(text: appState.streamingText)
+                                .font(.system(size: 13))
+                                .lineSpacing(3.5)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 12)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(assistBubbleBorder, lineWidth: 1)
+            )
+
+            Spacer(minLength: 52)
+        }
+        .padding(.bottom, 8)
     }
 }
 
@@ -972,12 +1015,6 @@ struct UserBubbleView: View {
 struct AssistantBubbleView: View {
     let message: ChatMessage
 
-    private var isStreamingPlaceholder: Bool {
-        guard message.blocks.count == 1,
-              case .text(let t) = message.blocks[0] else { return false }
-        return t.isEmpty
-    }
-
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             // Claude 头像
@@ -992,31 +1029,26 @@ struct AssistantBubbleView: View {
                 .padding(.top, 3)
 
             Group {
-                if isStreamingPlaceholder {
-                    StreamingDotsView()
-                        .padding(.horizontal, 18).padding(.vertical, 14)
-                } else {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
-                            Group {
-                                switch block {
-                                case .text(let t):
-                                    if !t.isEmpty {
-                                        MarkdownText(text: t)
-                                            .font(.system(size: 13))
-                                            .lineSpacing(3.5)
-                                            .textSelection(.enabled)
-                                    }
-                                case .thinking(let t):
-                                    ThinkingBlockView(text: t)
-                                case .toolCall:
-                                    EmptyView() // 工具调用已是独立消息，不在此渲染
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
+                        Group {
+                            switch block {
+                            case .text(let t):
+                                if !t.isEmpty {
+                                    MarkdownText(text: t)
+                                        .font(.system(size: 13))
+                                        .lineSpacing(3.5)
+                                        .textSelection(.enabled)
                                 }
+                            case .thinking(let t):
+                                ThinkingBlockView(text: t)
+                            case .toolCall:
+                                EmptyView()
                             }
                         }
                     }
-                    .padding(.horizontal, 14).padding(.vertical, 12)
                 }
+                .padding(.horizontal, 14).padding(.vertical, 12)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .clipShape(RoundedRectangle(cornerRadius: 16))
