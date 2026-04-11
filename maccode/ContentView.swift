@@ -1139,6 +1139,7 @@ struct ProseView: View {
         case numbered(n: Int, String)   // 1. 2. 有序列表
         case rule                       // --- 水平分割线
         case blank                      // 空行（已去重）
+        case table(header: [String], rows: [[String]])  // Markdown 表格
 
         var isBlank: Bool { if case .blank = self { return true }; return false }
     }
@@ -1158,7 +1159,22 @@ struct ProseView: View {
             if !(nodes.last?.isBlank ?? false) { nodes.append(.blank) }
         }
 
-        for line in raw.components(separatedBy: "\n") {
+        let rawLines = raw.components(separatedBy: "\n")
+        var li = 0
+        while li < rawLines.count {
+            let line = rawLines[li]
+            // ── 表格检测：连续以 | 开头/包含 | 的行 ─────────
+            if isTableRow(line) {
+                flushPara()
+                var tableLines: [String] = [line]
+                li += 1
+                while li < rawLines.count && isTableRow(rawLines[li]) {
+                    tableLines.append(rawLines[li])
+                    li += 1
+                }
+                if let tbl = parseTable(tableLines) { nodes.append(tbl) }
+                continue
+            }
             if line.hasPrefix("### ") {
                 flushPara(); nodes.append(.heading(level: 3, content: String(line.dropFirst(4))))
             } else if line.hasPrefix("## ") {
@@ -1176,12 +1192,46 @@ struct ProseView: View {
             } else {
                 para.append(line)
             }
+            li += 1
         }
         flushPara()
         // 去掉首尾空行
         return nodes.drop(while: { $0.isBlank })
                     .reversed().drop(while: { $0.isBlank })
                     .reversed() as [Node]
+    }
+
+    // ── 表格辅助 ─────────────────────────────────────────
+    private func isTableRow(_ line: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        return t.hasPrefix("|") || (t.contains("|") && !t.hasPrefix("#"))
+    }
+
+    private func splitCells(_ line: String) -> [String] {
+        var t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("|") { t = String(t.dropFirst()) }
+        if t.hasSuffix("|") { t = String(t.dropLast()) }
+        return t.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    private func isSeparatorRow(_ line: String) -> Bool {
+        splitCells(line).allSatisfy { cell in
+            let c = cell.trimmingCharacters(in: CharacterSet(charactersIn: ":-"))
+            return c.isEmpty || c.allSatisfy { $0 == "-" }
+        }
+    }
+
+    private func parseTable(_ lines: [String]) -> Node? {
+        guard lines.count >= 1 else { return nil }
+        var filtered = lines
+        // 找到分隔行（--- 行）并移除
+        if filtered.count >= 2 && isSeparatorRow(filtered[1]) {
+            filtered.remove(at: 1)
+        }
+        guard !filtered.isEmpty else { return nil }
+        let header = splitCells(filtered[0])
+        let rows = filtered.dropFirst().map { splitCells($0) }
+        return .table(header: header, rows: Array(rows))
     }
 
     private func parseNumbered(_ line: String) -> (Int, String)? {
@@ -1220,6 +1270,8 @@ struct ProseView: View {
             switch nxt { case .bullet, .numbered: return 4; default: return 8 }
         case .paragraph:
             switch nxt { case .heading: return 14; case .blank: return 0; default: return 8 }
+        case .table:
+            return 10
         }
     }
 
@@ -1280,6 +1332,9 @@ struct ProseView: View {
 
         case .blank:
             Color.clear.frame(height: 6)
+
+        case .table(let header, let rows):
+            TableView(header: header, rows: rows)
         }
     }
 
@@ -1321,6 +1376,61 @@ struct ProseView: View {
         }
         flush()
         return result
+    }
+}
+
+// MARK: - 表格视图
+
+struct TableView: View {
+    let header: [String]
+    let rows: [[String]]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // 表头
+            HStack(spacing: 0) {
+                ForEach(Array(header.enumerated()), id: \.offset) { idx, cell in
+                    Text(cell)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundColor(.primary.opacity(0.85))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                    if idx < header.count - 1 {
+                        Rectangle().fill(Color.white.opacity(0.08)).frame(width: 1)
+                    }
+                }
+            }
+            .background(Color.white.opacity(0.07))
+
+            Rectangle().fill(Color.white.opacity(0.12)).frame(height: 1)
+
+            // 数据行
+            ForEach(Array(rows.enumerated()), id: \.offset) { rowIdx, row in
+                HStack(spacing: 0) {
+                    let colCount = max(header.count, row.count)
+                    ForEach(0..<colCount, id: \.self) { colIdx in
+                        let cell = colIdx < row.count ? row[colIdx] : ""
+                        Text(cell)
+                            .font(.system(size: 11.5))
+                            .foregroundColor(.primary.opacity(0.80))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                        if colIdx < colCount - 1 {
+                            Rectangle().fill(Color.white.opacity(0.06)).frame(width: 1)
+                        }
+                    }
+                }
+                .background(rowIdx % 2 == 0 ? Color.clear : Color.white.opacity(0.025))
+
+                if rowIdx < rows.count - 1 {
+                    Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+                }
+            }
+        }
+        .cornerRadius(6)
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.12), lineWidth: 1))
     }
 }
 
