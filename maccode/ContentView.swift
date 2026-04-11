@@ -659,7 +659,7 @@ struct ChatView: View {
 
             // 实时活动状态条
             if appState.isLoading {
-                LiveActivityBar(activity: appState.liveActivity, statusText: appState.statusText)
+                LiveActivityBar()
                     .padding(.horizontal, 80)
                     .padding(.top, 4)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -681,75 +681,119 @@ struct ChatView: View {
 // MARK: - 实时活动状态条
 
 struct LiveActivityBar: View {
-    let activity: String
-    let statusText: String
+    @Environment(AppState.self) var appState
 
     @State private var pulse = false
     @State private var dotPhase: Int = 0
-    @State private var displayText: String = ""
 
-    private let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
+    private let timer = Timer.publish(every: 0.45, on: .main, in: .common).autoconnect()
+
+    // ── 根据 kind 决定颜色/图标 ──────────────────────────
+    private var kindColor: Color {
+        switch appState.liveActivityKind {
+        case .connecting: return Color(red: 0.9, green: 0.65, blue: 0.1)   // 琥珀
+        case .thinking:   return Color(red: 0.65, green: 0.35, blue: 0.95) // 紫
+        case .toolUse:    return Color(red: 0.25, green: 0.55, blue: 1.0)   // 蓝
+        case .generating: return Color(red: 0.2, green: 0.78, blue: 0.55)  // 青绿
+        case .toolDone:   return Color(red: 0.3, green: 0.82, blue: 0.45)  // 绿
+        }
+    }
+    private var kindIcon: String {
+        switch appState.liveActivityKind {
+        case .connecting: return "antenna.radiowaves.left.and.right"
+        case .thinking:   return "brain.fill"
+        case .toolUse:    return "wrench.and.screwdriver.fill"
+        case .generating: return "sparkles"
+        case .toolDone:   return "checkmark.circle.fill"
+        }
+    }
+    private var kindLabel: String {
+        switch appState.liveActivityKind {
+        case .connecting: return "连接中"
+        case .thinking:
+            let mode = appState.settings.thinkingMode
+            switch mode {
+            case "启用": return "深度思考"
+            case "禁用": return "快速思考"
+            default:     return "自动思考"
+            }
+        case .toolUse:    return "工具调用"
+        case .generating: return "生成中"
+        case .toolDone:   return "已完成"
+        }
+    }
 
     var body: some View {
-        HStack(spacing: 8) {
-            // 动态脉冲圆点
-            ZStack {
-                Circle()
-                    .fill(Color.blue.opacity(0.18))
-                    .frame(width: 22, height: 22)
-                    .scaleEffect(pulse ? 1.25 : 1.0)
-                Circle()
-                    .fill(
-                        LinearGradient(colors: [Color(red:0.3,green:0.6,blue:1.0),
-                                                Color(red:0.15,green:0.45,blue:0.9)],
-                                       startPoint: .topLeading, endPoint: .bottomTrailing)
-                    )
-                    .frame(width: 8, height: 8)
+        VStack(alignment: .leading, spacing: 0) {
+            // ── 主行 ──────────────────────────────────────
+            HStack(spacing: 8) {
+                // 脉冲图标
+                ZStack {
+                    Circle()
+                        .fill(kindColor.opacity(0.15))
+                        .frame(width: 24, height: 24)
+                        .scaleEffect(pulse ? 1.3 : 1.0)
+                    Image(systemName: kindIcon)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(kindColor)
+                }
+                .animation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true), value: pulse)
+
+                // 模式标签
+                Text(kindLabel)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundColor(kindColor)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(kindColor.opacity(0.12))
+                    .cornerRadius(5)
+
+                // 活动文字
+                let shown = appState.liveActivity.isEmpty ? "Claude 正在处理..." : appState.liveActivity
+                Text(shown + dotStr)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.primary.opacity(0.72))
+                    .lineLimit(1)
+                    .animation(.easeInOut(duration: 0.15), value: shown)
+
+                Spacer(minLength: 0)
             }
-            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: pulse)
+            .padding(.horizontal, 12).padding(.vertical, 7)
 
-            // 活动文字
-            let shown = activity.isEmpty ? (statusText.isEmpty ? "Claude 正在处理..." : statusText) : activity
-            Text(shown + dots)
-                .font(.system(size: 12, weight: .medium, design: .default))
-                .foregroundColor(.primary.opacity(0.75))
-                .lineLimit(1)
-                .animation(.easeInOut(duration: 0.2), value: shown)
+            // ── 思考片段预览（仅思考阶段显示）───────────────
+            if appState.isThinking && !appState.thinkingSnippet.isEmpty {
+                Divider()
+                    .opacity(0.12)
+                    .padding(.horizontal, 12)
 
-            Spacer()
-
-            // 闪烁的 AI 标识
-            Text("AI")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundColor(.blue.opacity(0.55))
-                .padding(.horizontal, 5).padding(.vertical, 2)
-                .background(Color.blue.opacity(0.08))
-                .cornerRadius(4)
+                HStack(spacing: 6) {
+                    Rectangle()
+                        .fill(kindColor.opacity(0.5))
+                        .frame(width: 2)
+                        .cornerRadius(1)
+                    Text(appState.thinkingSnippet)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundColor(.secondary.opacity(0.65))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 5)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
-        .padding(.horizontal, 12).padding(.vertical, 7)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(Color.white.opacity(0.04))
+                .fill(Color.white.opacity(0.03))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
-                        .stroke(
-                            LinearGradient(
-                                colors: [Color.blue.opacity(0.30), Color.blue.opacity(0.10)],
-                                startPoint: .leading, endPoint: .trailing
-                            ),
-                            lineWidth: 1
-                        )
+                        .stroke(kindColor.opacity(0.28), lineWidth: 1)
                 )
         )
+        .animation(.easeInOut(duration: 0.25), value: appState.liveActivityKind == .thinking)
         .onAppear { pulse = true }
-        .onReceive(timer) { _ in
-            dotPhase = (dotPhase + 1) % 4
-        }
+        .onReceive(timer) { _ in dotPhase = (dotPhase + 1) % 4 }
     }
 
-    private var dots: String {
-        String(repeating: ".", count: dotPhase)
-    }
+    private var dotStr: String { String(repeating: ".", count: dotPhase) }
 }
 
 // MARK: - 欢迎界面

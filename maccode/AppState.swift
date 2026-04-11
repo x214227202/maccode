@@ -79,6 +79,13 @@ class AppState {
 
     /// 实时活动描述（工具调用时更新，显示在聊天区底部）
     var liveActivity: String = ""
+    /// 当前是否正在深度思考阶段
+    var isThinking: Bool = false
+    /// 实时思考片段（最新一行，用于 LiveActivityBar 预览）
+    var thinkingSnippet: String = ""
+    /// 当前活动类型，供 UI 选择图标/颜色
+    enum LiveActivityKind { case connecting, thinking, toolUse, generating, toolDone }
+    var liveActivityKind: LiveActivityKind = .connecting
 
     /// 每次节流更新 UI 时自增，供 ChatView 触发自动滚动
     var streamingVersion: Int = 0
@@ -454,6 +461,8 @@ class AppState {
                         case .initSystem(let m):
                             capturedSid = m.sessionId
                             statusText = "已连接 · \(m.tools.count) 个工具"
+                            liveActivity = "已连接，\(m.tools.count) 个工具就绪"
+                            liveActivityKind = .connecting
                             if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
                                 sessions[idx].sdkSessionId = m.sessionId
                             }
@@ -465,10 +474,25 @@ class AppState {
                                 switch content {
                                 case .text(let text, _):
                                     textBuffer = text
-                                    if !text.isEmpty { liveActivity = "正在生成回复..." }
+                                    if !text.isEmpty {
+                                        liveActivity = "正在生成回复..."
+                                        liveActivityKind = .generating
+                                        isThinking = false
+                                        thinkingSnippet = ""
+                                    }
                                 case .thinking(let thinking):
                                     thinkingBuffer = thinking.thinking
-                                    liveActivity = "思考中..."
+                                    isThinking = true
+                                    liveActivityKind = .thinking
+                                    liveActivity = "深度推理中..."
+                                    // 取最后一行非空内容作为实时片段
+                                    let lastLine = thinking.thinking
+                                        .components(separatedBy: "\n")
+                                        .reversed()
+                                        .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) ?? ""
+                                    thinkingSnippet = lastLine.count > 60
+                                        ? String(lastLine.prefix(60)) + "…"
+                                        : lastLine
                                 case .toolUse(let tool):
                                     // 每个新工具 → 独立的 .tool 消息（不混入助手气泡）
                                     if !knownToolIds.contains(tool.id) {
@@ -480,6 +504,9 @@ class AppState {
                                         appendMessage(ChatMessage(id: toolMsgId, role: .tool,
                                                                   blocks: [.toolCall(block)]), to: sessionId)
                                         liveActivity = toolActivityDescription(tool.name, tool.input)
+                                        liveActivityKind = .toolUse
+                                        isThinking = false
+                                        thinkingSnippet = ""
                                         addLog(.info, "toolUse: \(tool.name)")
                                     }
                                 default: break
@@ -511,6 +538,7 @@ class AppState {
                                                                result: rt, in: sessionId)
                                     }
                                     liveActivity = "工具执行完成，等待回复..."
+                                    liveActivityKind = .toolDone
                                 }
                             }
 
@@ -583,6 +611,9 @@ class AppState {
         isLoading = false
         statusText = ""
         liveActivity = ""
+        isThinking = false
+        thinkingSnippet = ""
+        liveActivityKind = .connecting
         streamTask = nil
     }
 
@@ -622,6 +653,9 @@ class AppState {
         isLoading = false
         statusText = ""
         liveActivity = ""
+        isThinking = false
+        thinkingSnippet = ""
+        liveActivityKind = .connecting
         addLog(.info, "用户取消响应")
     }
 
