@@ -612,23 +612,37 @@ struct ChatView: View {
                                 ChatMessageView(message: msg)
                                     .id(msg.id)
                             }
-                            // 流式响应时的加载占位
+                            // 极短暂出现：用户消息已加，助手占位尚未添加时
                             if appState.isLoading && appState.currentMessages.last?.role == .user {
-                                ThinkingIndicator()
-                                    .id("thinking")
+                                HStack(alignment: .top, spacing: 10) {
+                                    RoundedRectangle(cornerRadius: 7)
+                                        .fill(claudeAvatarGradient)
+                                        .frame(width: 26, height: 26)
+                                        .overlay(Image(systemName: "asterisk")
+                                            .font(.system(size: 14, weight: .bold)).foregroundColor(.white))
+                                        .padding(.top, 3)
+                                    StreamingDotsView()
+                                        .padding(.horizontal, 18).padding(.vertical, 14)
+                                        .background(assistBubbleFill)
+                                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                                        .overlay(RoundedRectangle(cornerRadius: 16)
+                                            .stroke(assistBubbleBorder, lineWidth: 1))
+                                    Spacer(minLength: 52)
+                                }
+                                .padding(.bottom, 16)
+                                .id("streaming-placeholder")
                             }
                         }
                         .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 8)
                     }
                     .scrollIndicators(.hidden)
                     .onChange(of: appState.currentMessages.count) { _, _ in
-                        // 新消息添加时滚动到底部
                         if let lastId = appState.currentMessages.last?.id {
                             proxy.scrollTo(lastId, anchor: .bottom)
                         }
                     }
                     .onChange(of: appState.streamingVersion) { _, _ in
-                        // 流式内容更新时（已节流 80ms）持续跟随底部
+                        // 节流 80ms 的内容更新，无动画直接跟随避免抖动
                         if let lastId = appState.currentMessages.last?.id {
                             proxy.scrollTo(lastId, anchor: .bottom)
                         }
@@ -717,37 +731,62 @@ struct ErrorBanner: View {
     }
 }
 
-// MARK: - 思考中指示器
+// MARK: - 气泡颜色常量
 
-struct ThinkingIndicator: View {
-    @State private var dotPhase = 0
-    let timer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
+/// 用户气泡：金色渐变描边
+private let userBubbleBorder = LinearGradient(
+    colors: [
+        Color(red: 1.0, green: 0.86, blue: 0.28).opacity(0.90),
+        Color(red: 0.90, green: 0.62, blue: 0.00).opacity(0.55)
+    ],
+    startPoint: .topLeading, endPoint: .bottomTrailing
+)
+private let userBubbleFill = Color(red: 1.0, green: 0.80, blue: 0.10).opacity(0.08)
+
+/// 助手气泡：蓝色渐变描边
+private let assistBubbleBorder = LinearGradient(
+    colors: [
+        Color(red: 0.45, green: 0.68, blue: 1.00).opacity(0.70),
+        Color(red: 0.20, green: 0.47, blue: 0.92).opacity(0.40)
+    ],
+    startPoint: .topLeading, endPoint: .bottomTrailing
+)
+private let assistBubbleFill = Color(red: 0.25, green: 0.52, blue: 1.00).opacity(0.06)
+
+/// Claude 头像渐变（橙红）
+private let claudeAvatarGradient = LinearGradient(
+    colors: [Color(red: 0.95, green: 0.38, blue: 0.25), Color(red: 0.85, green: 0.25, blue: 0.15)],
+    startPoint: .topLeading, endPoint: .bottomTrailing
+)
+
+// MARK: - 流式加载波浪动画
+
+struct StreamingDotsView: View {
+    @State private var phase = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            RoundedRectangle(cornerRadius: 7)
-                .fill(LinearGradient(
-                    colors: [Color(red: 0.95, green: 0.38, blue: 0.25), Color(red: 0.85, green: 0.25, blue: 0.15)],
-                    startPoint: .topLeading, endPoint: .bottomTrailing
-                ))
-                .frame(width: 26, height: 26)
-                .overlay(Image(systemName: "asterisk").font(.system(size: 14, weight: .bold)).foregroundColor(.white))
-                .padding(.top, 2)
-
-            HStack(spacing: 4) {
-                ForEach(0..<3) { i in
-                    Circle()
-                        .fill(Color.secondary.opacity(i == dotPhase ? 0.7 : 0.25))
-                        .frame(width: 6, height: 6)
-                }
+        HStack(spacing: 6) {
+            ForEach(0..<3, id: \.self) { i in
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [Color(red: 0.45, green: 0.72, blue: 1.0),
+                                     Color(red: 0.25, green: 0.50, blue: 0.95)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                    )
+                    .frame(width: 7, height: 7)
+                    .offset(y: phase ? -4 : 3)
+                    .opacity(phase ? 0.95 : 0.30)
+                    .animation(
+                        .easeInOut(duration: 0.50)
+                            .repeatForever(autoreverses: true)
+                            .delay(Double(i) * 0.17),
+                        value: phase
+                    )
             }
-            .padding(.top, 10)
-            Spacer()
         }
-        .padding(.bottom, 18)
-        .onReceive(timer) { _ in
-            dotPhase = (dotPhase + 1) % 3
-        }
+        .onAppear { phase = true }
     }
 }
 
@@ -756,42 +795,41 @@ struct ThinkingIndicator: View {
 struct ChatMessageView: View {
     let message: ChatMessage
 
-    var isUser: Bool { message.role == .user }
-
-    var avatar: some View {
-        Group {
-            if isUser {
-                Circle().fill(Color.indigo.opacity(0.85)).frame(width: 26, height: 26)
-                    .overlay(Text("U").font(.system(size: 12, weight: .bold)).foregroundColor(.white))
-            } else {
-                RoundedRectangle(cornerRadius: 7)
-                    .fill(LinearGradient(
-                        colors: [Color(red: 0.95, green: 0.38, blue: 0.25), Color(red: 0.85, green: 0.25, blue: 0.15)],
-                        startPoint: .topLeading, endPoint: .bottomTrailing
-                    ))
-                    .frame(width: 26, height: 26)
-                    .overlay(Image(systemName: "asterisk").font(.system(size: 14, weight: .bold)).foregroundColor(.white))
-            }
+    var body: some View {
+        if message.role == .user {
+            UserBubbleView(message: message)
+        } else {
+            AssistantBubbleView(message: message)
         }
-        .padding(.top, 2)
     }
+}
+
+// MARK: 用户气泡（金色，靠右）
+
+struct UserBubbleView: View {
+    let message: ChatMessage
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            if isUser {
-                Spacer(minLength: 60)
-                VStack(alignment: .trailing, spacing: 8) {
-                    ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
+        HStack(alignment: .bottom, spacing: 0) {
+            Spacer(minLength: 72)
+            VStack(alignment: .trailing, spacing: 6) {
+                ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
+                    Group {
                         switch block {
                         case .text(let t):
                             if !t.isEmpty {
                                 Text(t)
                                     .font(.system(size: 13))
-                                    .lineSpacing(3)
+                                    .lineSpacing(3.5)
+                                    .foregroundColor(.primary.opacity(0.92))
                                     .textSelection(.enabled)
-                                    .padding(.horizontal, 12).padding(.vertical, 8)
-                                    .background(Color.blue.opacity(0.22))
-                                    .cornerRadius(12)
+                                    .padding(.horizontal, 14).padding(.vertical, 11)
+                                    .background(userBubbleFill)
+                                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 16)
+                                            .stroke(userBubbleBorder, lineWidth: 1)
+                                    )
                             }
                         case .toolCall(let tc):
                             ToolCallView(tool: tc)
@@ -800,33 +838,75 @@ struct ChatMessageView: View {
                         }
                     }
                 }
-                avatar
-            } else {
-                avatar
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
-                        switch block {
-                        case .text(let t):
-                            if !t.isEmpty {
-                                MarkdownText(text: t)
-                                    .font(.system(size: 13))
-                                    .lineSpacing(3)
-                                    .textSelection(.enabled)
-                            } else {
-                                // 等待响应占位（动态省略号）
-                                ThinkingIndicator()
-                            }
-                        case .toolCall(let tc):
-                            ToolCallView(tool: tc)
-                        case .thinking(let t):
-                            ThinkingBlockView(text: t)
-                        }
-                    }
-                }
-                Spacer(minLength: 0)
             }
         }
-        .padding(.bottom, 18)
+        .padding(.bottom, 16)
+    }
+}
+
+// MARK: 助手气泡（蓝色，靠左）
+
+struct AssistantBubbleView: View {
+    let message: ChatMessage
+
+    /// 是否还没有真实内容（仅初始占位）
+    private var isStreamingPlaceholder: Bool {
+        guard message.blocks.count == 1,
+              case .text(let t) = message.blocks[0] else { return false }
+        return t.isEmpty
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            // Claude 头像
+            RoundedRectangle(cornerRadius: 7)
+                .fill(claudeAvatarGradient)
+                .frame(width: 26, height: 26)
+                .overlay(
+                    Image(systemName: "asterisk")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white)
+                )
+                .padding(.top, 3)
+
+            // 气泡内容
+            Group {
+                if isStreamingPlaceholder {
+                    // 加载动画
+                    StreamingDotsView()
+                        .padding(.horizontal, 18).padding(.vertical, 14)
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
+                            switch block {
+                            case .text(let t):
+                                if !t.isEmpty {
+                                    MarkdownText(text: t)
+                                        .font(.system(size: 13))
+                                        .lineSpacing(3.5)
+                                        .textSelection(.enabled)
+                                }
+                            case .toolCall(let tc):
+                                ToolCallView(tool: tc)
+                            case .thinking(let t):
+                                ThinkingBlockView(text: t)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 12)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(assistBubbleFill)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(assistBubbleBorder, lineWidth: 1)
+            )
+
+            Spacer(minLength: 52)
+        }
+        .padding(.bottom, 16)
     }
 }
 
