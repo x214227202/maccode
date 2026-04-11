@@ -1496,42 +1496,43 @@ struct FilesPanel: View {
     }
 
     func loadChildren(of parent: FileItem) {
-        loadingPaths.insert(parent.path)
-        let depth = parent.depth + 1
         let path = parent.path
-        DispatchQueue.global(qos: .userInitiated).async {
-            let items = loadDirItems(path, depth: depth)
-            DispatchQueue.main.async {
-                self.childrenByPath[path] = items
-                self.loadingPaths.remove(path)
-            }
+        let depth = parent.depth + 1
+        loadingPaths.insert(path)
+        Task { @MainActor in
+            let items = await Task.detached(priority: .userInitiated) {
+                loadDirItems(path, depth: depth)
+            }.value
+            childrenByPath[path] = items
+            loadingPaths.remove(path)
         }
     }
 
     func loadRootItems(from dir: String) {
         isLoadingRoot = true
         loadError = nil
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fm = FileManager.default
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else {
-                DispatchQueue.main.async {
-                    self.isLoadingRoot = false
-                    self.loadError = "路径不存在或不是目录"
+        Task { @MainActor in
+            // (items, errorMessage) — nil items 表示出错
+            let (items, errMsg): ([FileItem]?, String?) = await Task.detached(priority: .userInitiated) {
+                let fm = FileManager.default
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else {
+                    return (nil, "路径不存在或不是目录")
                 }
-                return
+                return (loadDirItems(dir, depth: 0), nil)
+            }.value
+            if let items {
+                rootItems = items
+            } else {
+                loadError = errMsg
             }
-            let items = loadDirItems(dir, depth: 0)
-            DispatchQueue.main.async {
-                self.rootItems = items
-                self.isLoadingRoot = false
-            }
+            isLoadingRoot = false
         }
     }
 }
 
 // 从磁盘读取目录内容（可在后台线程调用）
-private func loadDirItems(_ dir: String, depth: Int) -> [FileItem] {
+private nonisolated func loadDirItems(_ dir: String, depth: Int) -> [FileItem] {
     let fm = FileManager.default
     guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
     return names

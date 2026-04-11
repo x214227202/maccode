@@ -440,17 +440,6 @@ class AppState {
                 var toolBlocks: [ToolCallBlock] = []
                 var capturedSid: String? = nil
 
-                // 构建当前 blocks 的辅助函数
-                func buildBlocks(finalText: String? = nil) -> [MessageBlock] {
-                    var blocks: [MessageBlock] = []
-                    if !thinkingBuffer.isEmpty { blocks.append(.thinking(thinkingBuffer)) }
-                    let t = finalText ?? textBuffer
-                    if !t.isEmpty { blocks.append(.text(t)) }
-                    for tc in toolBlocks { blocks.append(.toolCall(tc)) }
-                    if blocks.isEmpty { blocks = [.text("")] }
-                    return blocks
-                }
-
                 do {
                     for try await chunk in publisher.values {
                         switch chunk {
@@ -486,7 +475,13 @@ class AppState {
                                 default: break
                                 }
                             }
-                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: buildBlocks())
+                            // 组装当前 blocks
+                            var assistBlocks: [MessageBlock] = []
+                            if !thinkingBuffer.isEmpty { assistBlocks.append(.thinking(thinkingBuffer)) }
+                            if !textBuffer.isEmpty { assistBlocks.append(.text(textBuffer)) }
+                            for tc in toolBlocks { assistBlocks.append(.toolCall(tc)) }
+                            if assistBlocks.isEmpty { assistBlocks = [.text("")] }
+                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: assistBlocks)
 
                         case .user(let msg):
                             statusText = "工具执行中..."
@@ -504,12 +499,13 @@ class AppState {
 
                         case .result(let m):
                             addLog(.info, "✅ result: cost=$\(m.totalCostUsd) turns=\(m.numTurns) text=\(m.result?.count ?? 0)字")
-                            let finalText = m.result?.isEmpty == false ? m.result : nil
-                            var finalBlocks = buildBlocks(finalText: finalText)
-                            // 最终无内容时兜底
-                            if finalBlocks.count == 1, case .text(let t) = finalBlocks[0], t.isEmpty {
-                                finalBlocks = [.text("（操作完成）")]
-                            }
+                            // 组装最终 blocks
+                            let finalText = (m.result?.isEmpty == false) ? m.result! : textBuffer
+                            var finalBlocks: [MessageBlock] = []
+                            if !thinkingBuffer.isEmpty { finalBlocks.append(.thinking(thinkingBuffer)) }
+                            if !finalText.isEmpty { finalBlocks.append(.text(finalText)) }
+                            for tc in toolBlocks { finalBlocks.append(.toolCall(tc)) }
+                            if finalBlocks.isEmpty { finalBlocks = [.text("（操作完成）")] }
                             updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: finalBlocks)
                             let cost = String(format: "%.4f", m.totalCostUsd)
                             if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
