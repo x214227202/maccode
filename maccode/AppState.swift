@@ -130,6 +130,33 @@ class AppState {
     init() {
         initializeClient()
         loadSavedProjects()
+        loadLocalCache()     // 同步从本地 JSON 加载，毫秒级，立即可见
+    }
+
+    /// 从本地缓存同步加载所有会话（启动时立即显示，无需等待 Claude 存储解析）
+    private func loadLocalCache() {
+        let cached = LocalSessionStore.shared.loadAll()
+        guard !cached.isEmpty else { return }
+
+        var allSessions: [AgentSession] = []
+        for (session, messages) in cached {
+            allSessions.append(session)
+            messagesBySession[session.id] = messages
+
+            // 自动发现项目
+            if let path = session.workingDirectory, !path.isEmpty,
+               !projects.contains(where: { $0.path == path }) {
+                let proj = Project(name: URL(fileURLWithPath: path).lastPathComponent, path: path)
+                projects.append(proj)
+            }
+        }
+
+        sessions = allSessions
+        saveProjects()
+
+        if selectedProjectId == nil { selectedProjectId = projects.first?.id }
+        selectedSessionId = currentProjectSessions.first?.id
+        addLog(.info, "本地缓存加载 \(cached.count) 个会话（即时显示）")
     }
 
     func initializeClient() {
@@ -236,6 +263,8 @@ class AppState {
         selectedSessionId = session.id
         messagesBySession[session.id] = []
         errorMessage = nil
+        // 立即建立本地缓存文件（空消息）
+        LocalSessionStore.shared.save(session, messages: [])
 
         // 若当前没有项目且有目录，自动创建项目
         if let dir, selectedProject?.path != dir {
@@ -261,6 +290,7 @@ class AppState {
         if selectedSessionId == session.id {
             selectedSessionId = sessions.first?.id
         }
+        LocalSessionStore.shared.delete(id: session.id)
         addLog(.info, "删除会话 \(session.id)")
     }
 
@@ -332,14 +362,18 @@ class AppState {
 
                     loaded.append(session)
 
-                    // 若 UUID 未变，messagesBySession 已有数据则跳过重载（节省内存 + 避免清空流式消息）
-                    if existingSdkIdToAppId[s.id] == nil || messagesBySession[stableId] == nil {
+                    // 若 UUID 未变且本地已有缓存，跳过重载（避免覆盖流式期间的富消息）
+                    let alreadyCached = existingSdkIdToAppId[s.id] != nil && messagesBySession[stableId] != nil
+                    if !alreadyCached {
                         let recentMsgs = cleanedMessages.suffix(30)
-                        messagesBySession[stableId] = recentMsgs.map { item in
+                        let chatMsgs: [ChatMessage] = recentMsgs.map { item in
                             let role: MessageRole = item.msg.role == .user ? .user : .assistant
                             return ChatMessage(role: role, blocks: [.text(item.cleaned)])
                         }
-                        addLog(.debug, "会话 \(s.id.prefix(8))：加载 \(recentMsgs.count) 条消息")
+                        messagesBySession[stableId] = chatMsgs
+                        // 写入本地缓存（异步，不阻塞主线程）
+                        LocalSessionStore.shared.save(session, messages: chatMsgs)
+                        addLog(.debug, "会话 \(s.id.prefix(8))：加载并缓存 \(recentMsgs.count) 条消息")
                     }
                 }
 
@@ -601,6 +635,10 @@ class AppState {
                                 sessions[idx].sdkSessionId = capturedSid ?? m.sessionId
                                 sessions[idx].subtitle = "费用 $\(cost) · \(m.numTurns) 轮"
                                 sessions[idx].timestamp = "刚刚"
+                                // 流式结束：写入本地缓存
+                                let finishedSession = sessions[idx]
+                                let finishedMsgs = messagesBySession[sessionId] ?? []
+                                LocalSessionStore.shared.save(finishedSession, messages: finishedMsgs)
                             }
                         }
                     }
