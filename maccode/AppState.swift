@@ -77,6 +77,9 @@ class AppState {
     var errorMessage: String?
     var isClaudeInstalled: Bool = true
 
+    /// 每次节流更新 UI 时自增，供 ChatView 触发自动滚动
+    var streamingVersion: Int = 0
+
     // MARK: 调试日志（最新 200 条）
     var debugLogs: [DebugLogEntry] = []
 
@@ -433,12 +436,13 @@ class AppState {
 
             switch result {
             case .stream(let publisher):
-                // 使用 for await 在 @MainActor 上直接迭代，无需 Combine sink + MainActor.assumeIsolated
                 addLog(.info, "stream publisher 已获得，开始 for await 迭代...")
                 var textBuffer = ""
                 var thinkingBuffer = ""
                 var toolBlocks: [ToolCallBlock] = []
                 var capturedSid: String? = nil
+                // 节流：UI 更新最多每 80ms 一次，避免高频重绘卡顿
+                var lastUIUpdate: Date = .distantPast
 
                 do {
                     for try await chunk in publisher.values {
@@ -453,39 +457,35 @@ class AppState {
 
                         case .assistant(let msg):
                             statusText = "助手正在回复..."
-                            addLog(.debug, "✅ assistant chunk，content=\(msg.message.content.count)项")
                             for content in msg.message.content {
                                 switch content {
                                 case .text(let text, _):
                                     textBuffer = text
-                                    addLog(.debug, "  → text \(text.count)字：[\(text.prefix(60))]")
                                 case .thinking(let thinking):
                                     thinkingBuffer = thinking.thinking
-                                    addLog(.debug, "  → thinking \(thinking.thinking.count)字")
                                 case .toolUse(let tool):
                                     if !toolBlocks.contains(where: { $0.toolId == tool.id }) {
                                         let args = jsonDescription(tool.input)
                                         toolBlocks.append(ToolCallBlock(toolName: tool.name, args: args, toolId: tool.id))
-                                        addLog(.debug, "  → toolUse: \(tool.name)")
+                                        addLog(.info, "toolUse: \(tool.name)")
                                     }
-                                case .serverToolUse(let tool):
-                                    addLog(.debug, "  → serverToolUse: \(tool.name)")
-                                case .webSearchToolResult(let r):
-                                    addLog(.debug, "  → webSearch: \(r.content.count) 条结果")
                                 default: break
                                 }
                             }
-                            // 组装当前 blocks
-                            var assistBlocks: [MessageBlock] = []
-                            if !thinkingBuffer.isEmpty { assistBlocks.append(.thinking(thinkingBuffer)) }
-                            if !textBuffer.isEmpty { assistBlocks.append(.text(textBuffer)) }
-                            for tc in toolBlocks { assistBlocks.append(.toolCall(tc)) }
-                            if assistBlocks.isEmpty { assistBlocks = [.text("")] }
-                            updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: assistBlocks)
+                            // 节流：距上次 UI 更新超过 80ms 才刷新
+                            let now = Date()
+                            if now.timeIntervalSince(lastUIUpdate) >= 0.08 {
+                                var assistBlocks: [MessageBlock] = []
+                                if !thinkingBuffer.isEmpty { assistBlocks.append(.thinking(thinkingBuffer)) }
+                                if !textBuffer.isEmpty { assistBlocks.append(.text(textBuffer)) }
+                                for tc in toolBlocks { assistBlocks.append(.toolCall(tc)) }
+                                if assistBlocks.isEmpty { assistBlocks = [.text("")] }
+                                updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: assistBlocks)
+                                lastUIUpdate = now
+                            }
 
                         case .user(let msg):
                             statusText = "工具执行中..."
-                            addLog(.debug, "✅ user chunk（工具结果）")
                             for content in msg.message.content {
                                 if case .toolResult(let result) = content, let tid = result.toolUseId {
                                     let rt: String
@@ -499,7 +499,7 @@ class AppState {
 
                         case .result(let m):
                             addLog(.info, "✅ result: cost=$\(m.totalCostUsd) turns=\(m.numTurns) text=\(m.result?.count ?? 0)字")
-                            // 组装最终 blocks
+                            // 强制最终刷新（不受节流限制）
                             let finalText = (m.result?.isEmpty == false) ? m.result! : textBuffer
                             var finalBlocks: [MessageBlock] = []
                             if !thinkingBuffer.isEmpty { finalBlocks.append(.thinking(thinkingBuffer)) }
@@ -662,13 +662,10 @@ class AppState {
 
     private func updateAssistantBlocks(_ id: UUID, in sessionId: UUID, blocks: [MessageBlock]) {
         guard var msgs = messagesBySession[sessionId],
-              let idx = msgs.firstIndex(where: { $0.id == id }) else {
-            addLog(.error, "updateAssistantBlocks: 找不到消息 \(id) in \(sessionId)")
-            return
-        }
+              let idx = msgs.firstIndex(where: { $0.id == id }) else { return }
         msgs[idx].blocks = blocks
         messagesBySession[sessionId] = msgs          // 显式赋值
-        addLog(.debug, "updateAssistantBlocks: 更新完成，blocks=\(blocks.count)")
+        streamingVersion &+= 1                        // 通知 ChatView 滚动
     }
 
     /// 更新指定工具调用的结果（在当前会话所有消息中查找）

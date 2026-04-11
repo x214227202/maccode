@@ -622,10 +622,15 @@ struct ChatView: View {
                     }
                     .scrollIndicators(.hidden)
                     .onChange(of: appState.currentMessages.count) { _, _ in
-                        withAnimation {
-                            if let lastId = appState.currentMessages.last?.id {
-                                proxy.scrollTo(lastId, anchor: .bottom)
-                            }
+                        // 新消息添加时滚动到底部
+                        if let lastId = appState.currentMessages.last?.id {
+                            proxy.scrollTo(lastId, anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: appState.streamingVersion) { _, _ in
+                        // 流式内容更新时（已节流 80ms）持续跟随底部
+                        if let lastId = appState.currentMessages.last?.id {
+                            proxy.scrollTo(lastId, anchor: .bottom)
                         }
                     }
                 }
@@ -917,9 +922,13 @@ struct MarkdownText: View {
 
     enum TextSegment { case prose(String); case code(String, language: String) }
 
-    var segments: [TextSegment] {
+    // 缓存解析结果，text 不变时复用，避免每次渲染都重新扫描全文
+    @State private var cachedText: String = ""
+    @State private var cachedSegments: [TextSegment] = []
+
+    private func parseSegments(_ raw: String) -> [TextSegment] {
         var result: [TextSegment] = []
-        let lines = text.components(separatedBy: "\n")
+        let lines = raw.components(separatedBy: "\n")
         var i = 0
         var proseBuf: [String] = []
         while i < lines.count {
@@ -948,13 +957,24 @@ struct MarkdownText: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+        let segs: [TextSegment]
+        if text == cachedText {
+            segs = cachedSegments
+        } else {
+            segs = parseSegments(text)
+        }
+        return VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(segs.enumerated()), id: \.offset) { _, seg in
                 switch seg {
                 case .prose(let t): ProseView(text: t)
                 case .code(let code, let lang): CodeBlockView(code: code, language: lang)
                 }
             }
+        }
+        .onAppear { cachedText = text; cachedSegments = segs }
+        .onChange(of: text) { _, newText in
+            cachedText = newText
+            cachedSegments = parseSegments(newText)
         }
     }
 }
