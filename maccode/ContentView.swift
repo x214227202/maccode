@@ -632,20 +632,24 @@ struct ChatView: View {
                                 .padding(.bottom, 16)
                                 .id("streaming-placeholder")
                             }
+                            // 底部锚点，用于滚动定位
+                            Color.clear.frame(height: 1).id("__bottom__")
                         }
                         .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 8)
                     }
                     .scrollIndicators(.hidden)
+                    // 切换会话时立刻滚到底部
+                    .onAppear {
+                        proxy.scrollTo("__bottom__", anchor: .bottom)
+                    }
+                    .onChange(of: appState.selectedSessionId) { _, _ in
+                        proxy.scrollTo("__bottom__", anchor: .bottom)
+                    }
                     .onChange(of: appState.currentMessages.count) { _, _ in
-                        if let lastId = appState.currentMessages.last?.id {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                        proxy.scrollTo("__bottom__", anchor: .bottom)
                     }
                     .onChange(of: appState.streamingVersion) { _, _ in
-                        // 节流 80ms 的内容更新，无动画直接跟随避免抖动
-                        if let lastId = appState.currentMessages.last?.id {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                        proxy.scrollTo("__bottom__", anchor: .bottom)
                     }
                 }
             }
@@ -1122,75 +1126,201 @@ struct MarkdownText: View {
     }
 }
 
-// MARK: - Prose（行内 Markdown）
+// MARK: - Prose（段落式 Markdown 排版）
 
 struct ProseView: View {
     let text: String
 
+    // ── 节点类型 ──────────────────────────────────────────
+    private enum Node {
+        case heading(level: Int, content: String)
+        case paragraph(String)          // 多行合并为一段
+        case bullet(String)             // - * + 列表项
+        case numbered(n: Int, String)   // 1. 2. 有序列表
+        case rule                       // --- 水平分割线
+        case blank                      // 空行（已去重）
+
+        var isBlank: Bool { if case .blank = self { return true }; return false }
+    }
+
+    // ── 解析 ──────────────────────────────────────────────
+    private func parse(_ raw: String) -> [Node] {
+        var nodes: [Node] = []
+        var para: [String] = []
+
+        func flushPara() {
+            guard !para.isEmpty else { return }
+            nodes.append(.paragraph(para.joined(separator: "\n")))
+            para = []
+        }
+        func addBlank() {
+            flushPara()
+            if !(nodes.last?.isBlank ?? false) { nodes.append(.blank) }
+        }
+
+        for line in raw.components(separatedBy: "\n") {
+            if line.hasPrefix("### ") {
+                flushPara(); nodes.append(.heading(level: 3, content: String(line.dropFirst(4))))
+            } else if line.hasPrefix("## ") {
+                flushPara(); nodes.append(.heading(level: 2, content: String(line.dropFirst(3))))
+            } else if line.hasPrefix("# ") {
+                flushPara(); nodes.append(.heading(level: 1, content: String(line.dropFirst(2))))
+            } else if line == "---" || line == "***" || line == "___" {
+                flushPara(); nodes.append(.rule)
+            } else if line.hasPrefix("- ") || line.hasPrefix("* ") || line.hasPrefix("+ ") {
+                flushPara(); nodes.append(.bullet(String(line.dropFirst(2))))
+            } else if let (n, content) = parseNumbered(line) {
+                flushPara(); nodes.append(.numbered(n: n, content))
+            } else if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                addBlank()
+            } else {
+                para.append(line)
+            }
+        }
+        flushPara()
+        // 去掉首尾空行
+        return nodes.drop(while: { $0.isBlank })
+                    .reversed().drop(while: { $0.isBlank })
+                    .reversed() as [Node]
+    }
+
+    private func parseNumbered(_ line: String) -> (Int, String)? {
+        var i = line.startIndex
+        var numStr = ""
+        while i < line.endIndex && line[i].isNumber { numStr.append(line[i]); i = line.index(after: i) }
+        guard !numStr.isEmpty,
+              i < line.endIndex, line[i] == ".",
+              let after = line.index(i, offsetBy: 1, limitedBy: line.endIndex), after < line.endIndex,
+              line[after] == " ",
+              let n = Int(numStr) else { return nil }
+        let content = String(line[line.index(after, offsetBy: 1)...])
+        return content.isEmpty ? nil : (n, content)
+    }
+
+    // ── 渲染 ──────────────────────────────────────────────
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(text.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
-                if line.hasPrefix("- ") {
-                    HStack(alignment: .top, spacing: 6) {
-                        Text("•").foregroundColor(.secondary)
-                        renderedLine(Substring(line.dropFirst(2)))
-                    }
-                } else if line.hasPrefix("# ") {
-                    renderedLine(Substring(line.dropFirst(2))).bold().font(.system(size: 15))
-                } else if line.hasPrefix("## ") {
-                    renderedLine(Substring(line.dropFirst(3))).bold().font(.system(size: 14))
-                } else if line.hasPrefix("### ") {
-                    renderedLine(Substring(line.dropFirst(4))).bold().font(.system(size: 13))
-                } else if !line.isEmpty {
-                    renderedLine(Substring(line))
-                } else {
-                    Spacer().frame(height: 2)
+        let nodes = parse(text)
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(nodes.enumerated()), id: \.offset) { idx, node in
+                nodeView(node)
+                    .padding(.bottom, bottomPad(nodes, idx))
+            }
+        }
+    }
+
+    private func bottomPad(_ nodes: [Node], _ i: Int) -> CGFloat {
+        guard i < nodes.count - 1 else { return 0 }
+        let cur = nodes[i]; let nxt = nodes[i + 1]
+        switch cur {
+        case .blank:   return 0
+        case .rule:    return 8
+        case .heading(let lv, _):
+            return lv == 1 ? 8 : 5
+        case .bullet, .numbered:
+            switch nxt { case .bullet, .numbered: return 4; default: return 8 }
+        case .paragraph:
+            switch nxt { case .heading: return 14; case .blank: return 0; default: return 8 }
+        }
+    }
+
+    @ViewBuilder
+    private func nodeView(_ node: Node) -> some View {
+        switch node {
+
+        case .heading(let level, let content):
+            VStack(alignment: .leading, spacing: 4) {
+                inline(content)
+                    .font(.system(
+                        size: level == 1 ? 16 : level == 2 ? 14 : 13,
+                        weight: level == 1 ? .bold : .semibold
+                    ))
+                    .fixedSize(horizontal: false, vertical: true)
+                if level <= 2 {
+                    Rectangle().fill(Color.secondary.opacity(0.14)).frame(height: 1)
                 }
             }
-        }
-    }
 
-    func renderedLine(_ raw: Substring) -> Text {
-        inlineSegs(String(raw)).reduce(Text("")) { acc, seg in
-            if seg.isBold {
-                return acc + Text(seg.text).bold()
-            } else if seg.isCode {
-                return acc + Text(seg.text)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(.primary.opacity(0.9))
-            } else {
-                return acc + Text(seg.text)
+        case .paragraph(let t):
+            inline(t)
+                .font(.system(size: 13))
+                .lineSpacing(4)
+                .fixedSize(horizontal: false, vertical: true)
+
+        case .bullet(let content):
+            HStack(alignment: .top, spacing: 8) {
+                Text("•")
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary.opacity(0.7))
+                    .frame(width: 12, alignment: .center)
+                    .padding(.top, 0.5)
+                inline(content)
+                    .font(.system(size: 13))
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+
+        case .numbered(let n, let content):
+            HStack(alignment: .top, spacing: 6) {
+                Text("\(n).")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.secondary.opacity(0.65))
+                    .frame(minWidth: 20, alignment: .trailing)
+                    .padding(.top, 0.5)
+                inline(content)
+                    .font(.system(size: 13))
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+        case .rule:
+            Rectangle()
+                .fill(Color.secondary.opacity(0.18))
+                .frame(height: 1)
+                .padding(.vertical, 4)
+
+        case .blank:
+            Color.clear.frame(height: 6)
         }
     }
 
-    struct Seg { var text: String; var isBold = false; var isCode = false }
+    // ── 行内标记：**bold** *italic* `code` ────────────────
+    private func inline(_ raw: String) -> Text {
+        var result = Text("")
+        var buf = ""
+        var i = raw.startIndex
 
-    func inlineSegs(_ s: String) -> [Seg] {
-        var out: [Seg] = []
-        var cur = ""
-        var i = s.startIndex
-        while i < s.endIndex {
-            if s[i...].hasPrefix("**") {
-                if !cur.isEmpty { out.append(Seg(text: cur)); cur = "" }
-                let st = s.index(i, offsetBy: 2)
-                if let rng = s[st...].range(of: "**") {
-                    out.append(Seg(text: String(s[st..<rng.lowerBound]), isBold: true))
+        func flush() { if !buf.isEmpty { result = result + Text(buf); buf = "" } }
+
+        while i < raw.endIndex {
+            if raw[i...].hasPrefix("**") {
+                flush()
+                let st = raw.index(i, offsetBy: 2)
+                if let rng = raw[st...].range(of: "**") {
+                    result = result + Text(String(raw[st..<rng.lowerBound])).bold()
                     i = rng.upperBound
-                } else { cur += "**"; i = st }
-            } else if s[i] == "`" {
-                if !cur.isEmpty { out.append(Seg(text: cur)); cur = "" }
-                let st = s.index(after: i)
-                if let end = s[st...].firstIndex(of: "`") {
-                    out.append(Seg(text: String(s[st..<end]), isCode: true))
-                    i = s.index(after: end)
-                } else { cur += "`"; i = s.index(after: i) }
+                } else { buf += "**"; i = st }
+            } else if raw[i] == "*" {
+                flush()
+                let st = raw.index(after: i)
+                if let end = raw[st...].firstIndex(of: "*") {
+                    result = result + Text(String(raw[st..<end])).italic()
+                    i = raw.index(after: end)
+                } else { buf += "*"; i = raw.index(after: i) }
+            } else if raw[i] == "`" {
+                flush()
+                let st = raw.index(after: i)
+                if let end = raw[st...].firstIndex(of: "`") {
+                    result = result + Text(String(raw[st..<end]))
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.primary.opacity(0.88))
+                    i = raw.index(after: end)
+                } else { buf += "`"; i = raw.index(after: i) }
             } else {
-                cur.append(s[i]); i = s.index(after: i)
+                buf.append(raw[i]); i = raw.index(after: i)
             }
         }
-        if !cur.isEmpty { out.append(Seg(text: cur)) }
-        return out
+        flush()
+        return result
     }
 }
 
