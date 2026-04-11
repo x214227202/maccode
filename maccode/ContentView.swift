@@ -283,9 +283,8 @@ struct ProjectTreePanel: View {
                         .onTapGesture {
                             withAnimation(.spring(response: 0.3, dampingFraction: 0.78)) {
                                 if isExpanded {
-                                    // 再次点击已展开项目 → 收起
+                                    // 再次点击已展开项目 → 仅收起折叠，不清除会话（保持中间区域不变）
                                     appState.selectedProjectId = nil
-                                    appState.selectedSessionId = nil
                                 } else {
                                     appState.selectProject(project)
                                 }

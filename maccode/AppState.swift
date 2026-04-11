@@ -194,8 +194,14 @@ class AppState {
     /// 选中项目
     func selectProject(_ project: Project) {
         selectedProjectId = project.id
-        // 自动选中该项目最近的会话
-        selectedSessionId = currentProjectSessions.first?.id
+        // 若当前选中会话已在该项目下，保持不变；否则自动选第一个
+        let projectSessions = sessions.filter { $0.workingDirectory == project.path }
+        let currentInProject = selectedSessionId.map { id in
+            projectSessions.contains { $0.id == id }
+        } ?? false
+        if !currentInProject {
+            selectedSessionId = projectSessions.first?.id
+        }
         errorMessage = nil
         addLog(.info, "切换项目：\(project.name)")
     }
@@ -327,7 +333,14 @@ class AppState {
                 }
 
                 if !loaded.isEmpty {
-                    sessions = loaded
+                    // ── 合并而非替换：保留用户在内存中创建但尚未上传的会话 ──
+                    let loadedSdkIds = Set(loaded.compactMap { $0.sdkSessionId })
+                    let inMemoryOnly = sessions.filter { s in
+                        // 保留没有 sdkSessionId 的新会话（未发送），或 sdkId 不在加载列表中的
+                        guard let sid = s.sdkSessionId else { return true }
+                        return !loadedSdkIds.contains(sid)
+                    }
+                    sessions = inMemoryOnly + loaded
 
                     // 从历史会话中自动发现项目（去重）
                     var discoveredPaths = Set<String>()
@@ -353,7 +366,14 @@ class AppState {
                     if selectedProjectId == nil {
                         selectedProjectId = projects.first?.id
                     }
-                    selectedSessionId = currentProjectSessions.first?.id
+
+                    // ── 保留 selectedSessionId：若当前选中会话仍在 sessions 中，不要覆盖 ──
+                    let currentStillValid = selectedSessionId.map { id in
+                        sessions.contains { $0.id == id }
+                    } ?? false
+                    if !currentStillValid {
+                        selectedSessionId = currentProjectSessions.first?.id
+                    }
                     addLog(.info, "成功加载 \(loaded.count) 个会话，\(projects.count) 个项目")
                 } else {
                     addLog(.info, "未找到有效历史会话")
