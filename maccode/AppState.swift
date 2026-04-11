@@ -439,10 +439,11 @@ class AppState {
                 addLog(.info, "stream publisher 已获得，开始 for await 迭代...")
                 var textBuffer = ""
                 var thinkingBuffer = ""
-                var toolBlocks: [ToolCallBlock] = []
                 var capturedSid: String? = nil
-                // 节流：UI 更新最多每 80ms 一次，避免高频重绘卡顿
                 var lastUIUpdate: Date = .distantPast
+                // clui-cc 模式：每个工具调用 = 独立消息，用 toolId 追踪
+                var knownToolIds: Set<String> = []
+                var toolMsgIdByToolId: [String: UUID] = [:]
 
                 do {
                     for try await chunk in publisher.values {
@@ -464,22 +465,27 @@ class AppState {
                                 case .thinking(let thinking):
                                     thinkingBuffer = thinking.thinking
                                 case .toolUse(let tool):
-                                    if !toolBlocks.contains(where: { $0.toolId == tool.id }) {
+                                    // 每个新工具 → 独立的 .tool 消息（不混入助手气泡）
+                                    if !knownToolIds.contains(tool.id) {
+                                        knownToolIds.insert(tool.id)
+                                        let toolMsgId = UUID()
+                                        toolMsgIdByToolId[tool.id] = toolMsgId
                                         let args = jsonDescription(tool.input)
-                                        toolBlocks.append(ToolCallBlock(toolName: tool.name, args: args, toolId: tool.id))
+                                        let block = ToolCallBlock(toolName: tool.name, args: args, toolId: tool.id)
+                                        appendMessage(ChatMessage(id: toolMsgId, role: .tool,
+                                                                  blocks: [.toolCall(block)]), to: sessionId)
                                         addLog(.info, "toolUse: \(tool.name)")
                                     }
                                 default: break
                                 }
                             }
-                            // 节流：距上次 UI 更新超过 80ms 才刷新
+                            // 节流：80ms 更新一次文字气泡（仅文字 + 思考）
                             let now = Date()
                             if now.timeIntervalSince(lastUIUpdate) >= 0.08 {
                                 var assistBlocks: [MessageBlock] = []
                                 if !thinkingBuffer.isEmpty { assistBlocks.append(.thinking(thinkingBuffer)) }
-                                if !textBuffer.isEmpty { assistBlocks.append(.text(textBuffer)) }
-                                for tc in toolBlocks { assistBlocks.append(.toolCall(tc)) }
-                                if assistBlocks.isEmpty { assistBlocks = [.text("")] }
+                                if !textBuffer.isEmpty    { assistBlocks.append(.text(textBuffer)) }
+                                if assistBlocks.isEmpty   { assistBlocks = [.text("")] }
                                 updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: assistBlocks)
                                 lastUIUpdate = now
                             }
@@ -493,19 +499,22 @@ class AppState {
                                     case .string(let s): rt = s
                                     case .items: rt = "(内容)"
                                     }
-                                    updateToolResult(toolId: tid, result: rt, in: sessionId)
+                                    // 精确更新对应工具消息，不做全局搜索
+                                    if let toolMsgId = toolMsgIdByToolId[tid] {
+                                        updateToolMessageResult(toolMsgId: toolMsgId, toolId: tid,
+                                                               result: rt, in: sessionId)
+                                    }
                                 }
                             }
 
                         case .result(let m):
-                            addLog(.info, "✅ result: cost=$\(m.totalCostUsd) turns=\(m.numTurns) text=\(m.result?.count ?? 0)字")
-                            // 强制最终刷新（不受节流限制）
+                            addLog(.info, "✅ result: cost=$\(m.totalCostUsd) turns=\(m.numTurns)")
+                            // 强制最终刷新助手文字（不受节流）
                             let finalText = (m.result?.isEmpty == false) ? m.result! : textBuffer
                             var finalBlocks: [MessageBlock] = []
                             if !thinkingBuffer.isEmpty { finalBlocks.append(.thinking(thinkingBuffer)) }
-                            if !finalText.isEmpty { finalBlocks.append(.text(finalText)) }
-                            for tc in toolBlocks { finalBlocks.append(.toolCall(tc)) }
-                            if finalBlocks.isEmpty { finalBlocks = [.text("（操作完成）")] }
+                            if !finalText.isEmpty      { finalBlocks.append(.text(finalText)) }
+                            if finalBlocks.isEmpty     { finalBlocks = [.text("（操作完成）")] }
                             updateAssistantBlocks(assistantMsgId, in: sessionId, blocks: finalBlocks)
                             let cost = String(format: "%.4f", m.totalCostUsd)
                             if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
@@ -668,20 +677,19 @@ class AppState {
         streamingVersion &+= 1                        // 通知 ChatView 滚动
     }
 
-    /// 更新指定工具调用的结果（在当前会话所有消息中查找）
-    private func updateToolResult(toolId: String, result: String, in sessionId: UUID) {
-        guard var msgs = messagesBySession[sessionId] else { return }
-        for (mi, msg) in msgs.enumerated() {
-            for (bi, block) in msg.blocks.enumerated() {
-                if case .toolCall(let tc) = block, tc.toolId == toolId {
-                    msgs[mi].blocks[bi] =
-                        .toolCall(ToolCallBlock(toolName: tc.toolName, args: tc.args,
-                                               result: result, toolId: toolId))
-                    messagesBySession[sessionId] = msgs  // 显式赋值
-                    return
-                }
+    /// 精确更新工具消息的结果（通过 toolMsgId 直接定位，O(n) 不做全局搜索）
+    private func updateToolMessageResult(toolMsgId: UUID, toolId: String, result: String, in sessionId: UUID) {
+        guard var msgs = messagesBySession[sessionId],
+              let msgIdx = msgs.firstIndex(where: { $0.id == toolMsgId }) else { return }
+        msgs[msgIdx].blocks = msgs[msgIdx].blocks.map { block in
+            if case .toolCall(let tc) = block, tc.toolId == toolId {
+                return .toolCall(ToolCallBlock(toolName: tc.toolName, args: tc.args,
+                                              result: result, toolId: toolId))
             }
+            return block
         }
+        messagesBySession[sessionId] = msgs
+        streamingVersion &+= 1
     }
 
     /// 将工具输入字典转换为可读字符串

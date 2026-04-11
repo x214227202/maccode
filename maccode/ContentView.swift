@@ -14,7 +14,8 @@ struct AgentSession: Identifiable {
     var workingDirectory: String?   // 工作目录
 }
 
-enum MessageRole { case user, assistant }
+/// 消息角色：与 clui-cc 对齐，tool 单独一类
+enum MessageRole { case user, assistant, tool }
 
 struct ToolCallBlock: Identifiable {
     var id = UUID()
@@ -623,7 +624,6 @@ struct ChatView: View {
                                         .padding(.top, 3)
                                     StreamingDotsView()
                                         .padding(.horizontal, 18).padding(.vertical, 14)
-                                        .background(assistBubbleFill)
                                         .clipShape(RoundedRectangle(cornerRadius: 16))
                                         .overlay(RoundedRectangle(cornerRadius: 16)
                                             .stroke(assistBubbleBorder, lineWidth: 1))
@@ -796,15 +796,17 @@ struct ChatMessageView: View {
     let message: ChatMessage
 
     var body: some View {
-        if message.role == .user {
-            UserBubbleView(message: message)
-        } else {
-            AssistantBubbleView(message: message)
+        switch message.role {
+        case .user:       UserBubbleView(message: message)
+        case .assistant:  AssistantBubbleView(message: message)
+        case .tool:       ToolMessageView(message: message)
         }
     }
 }
 
 // MARK: 用户气泡（金色，靠右）
+
+// MARK: 用户气泡（金色线框，靠右，无底色）
 
 struct UserBubbleView: View {
     let message: ChatMessage
@@ -812,7 +814,6 @@ struct UserBubbleView: View {
     var body: some View {
         HStack(alignment: .bottom, spacing: 0) {
             Spacer(minLength: 72)
-            // 用户消息只有文字，直接取第一个 .text block
             VStack(alignment: .trailing, spacing: 6) {
                 ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
                     Group {
@@ -823,8 +824,6 @@ struct UserBubbleView: View {
                                 .foregroundColor(.primary.opacity(0.92))
                                 .textSelection(.enabled)
                                 .padding(.horizontal, 14).padding(.vertical, 11)
-                                .background(userBubbleFill)
-                                .clipShape(RoundedRectangle(cornerRadius: 16))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 16)
                                         .stroke(userBubbleBorder, lineWidth: 1)
@@ -838,35 +837,15 @@ struct UserBubbleView: View {
     }
 }
 
-// MARK: 助手气泡（蓝色文字 + 独立工具卡片，靠左）
+// MARK: 助手气泡（蓝色线框，靠左，无底色，仅含文字/思考）
 
 struct AssistantBubbleView: View {
     let message: ChatMessage
 
-    /// 是否仅有初始空占位（流式开始前）
     private var isStreamingPlaceholder: Bool {
         guard message.blocks.count == 1,
               case .text(let t) = message.blocks[0] else { return false }
         return t.isEmpty
-    }
-
-    /// 是否有非空文本或思考内容
-    private var hasTextContent: Bool {
-        message.blocks.contains {
-            switch $0 {
-            case .text(let t): return !t.isEmpty
-            case .thinking:    return true
-            case .toolCall:    return false
-            }
-        }
-    }
-
-    /// 工具调用列表（单独渲染，不混入文字气泡）
-    private var toolCalls: [ToolCallBlock] {
-        message.blocks.compactMap {
-            if case .toolCall(let tc) = $0 { return tc }
-            return nil
-        }
     }
 
     var body: some View {
@@ -882,17 +861,11 @@ struct AssistantBubbleView: View {
                 )
                 .padding(.top, 3)
 
-            VStack(alignment: .leading, spacing: 8) {
-                // ① 文字 / 思考气泡（蓝色）
-                if isStreamingPlaceholder && toolCalls.isEmpty {
-                    // 初始加载动画
+            Group {
+                if isStreamingPlaceholder {
                     StreamingDotsView()
                         .padding(.horizontal, 18).padding(.vertical, 14)
-                        .background(assistBubbleFill)
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
-                        .overlay(RoundedRectangle(cornerRadius: 16)
-                            .stroke(assistBubbleBorder, lineWidth: 1))
-                } else if hasTextContent {
+                } else {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
                             Group {
@@ -907,28 +880,48 @@ struct AssistantBubbleView: View {
                                 case .thinking(let t):
                                     ThinkingBlockView(text: t)
                                 case .toolCall:
-                                    EmptyView()
+                                    EmptyView() // 工具调用已是独立消息，不在此渲染
                                 }
                             }
                         }
                     }
                     .padding(.horizontal, 14).padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(assistBubbleFill)
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
-                    .overlay(RoundedRectangle(cornerRadius: 16)
-                        .stroke(assistBubbleBorder, lineWidth: 1))
-                }
-
-                // ② 工具执行卡片（代码/操作数据流，独立于文字气泡）
-                ForEach(toolCalls) { tc in
-                    ToolExecutionCard(tool: tc)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(assistBubbleBorder, lineWidth: 1)
+            )
 
             Spacer(minLength: 52)
         }
-        .padding(.bottom, 16)
+        .padding(.bottom, 8)
+    }
+}
+
+// MARK: 工具执行消息（独立于对话气泡，对齐至助手内容区）
+
+struct ToolMessageView: View {
+    let message: ChatMessage
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            // 占位宽度与头像对齐（26pt 头像 + 10pt 间距 = 36pt）
+            Color.clear.frame(width: 36)
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
+                    Group {
+                        if case .toolCall(let tc) = block {
+                            ToolExecutionCard(tool: tc)
+                        }
+                    }
+                }
+            }
+            Spacer(minLength: 52)
+        }
+        .padding(.bottom, 8)
     }
 }
 
