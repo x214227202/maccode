@@ -812,29 +812,23 @@ struct UserBubbleView: View {
     var body: some View {
         HStack(alignment: .bottom, spacing: 0) {
             Spacer(minLength: 72)
+            // 用户消息只有文字，直接取第一个 .text block
             VStack(alignment: .trailing, spacing: 6) {
                 ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
                     Group {
-                        switch block {
-                        case .text(let t):
-                            if !t.isEmpty {
-                                Text(t)
-                                    .font(.system(size: 13))
-                                    .lineSpacing(3.5)
-                                    .foregroundColor(.primary.opacity(0.92))
-                                    .textSelection(.enabled)
-                                    .padding(.horizontal, 14).padding(.vertical, 11)
-                                    .background(userBubbleFill)
-                                    .clipShape(RoundedRectangle(cornerRadius: 16))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .stroke(userBubbleBorder, lineWidth: 1)
-                                    )
-                            }
-                        case .toolCall(let tc):
-                            ToolCallView(tool: tc)
-                        case .thinking(let t):
-                            ThinkingBlockView(text: t)
+                        if case .text(let t) = block, !t.isEmpty {
+                            Text(t)
+                                .font(.system(size: 13))
+                                .lineSpacing(3.5)
+                                .foregroundColor(.primary.opacity(0.92))
+                                .textSelection(.enabled)
+                                .padding(.horizontal, 14).padding(.vertical, 11)
+                                .background(userBubbleFill)
+                                .clipShape(RoundedRectangle(cornerRadius: 16))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 16)
+                                        .stroke(userBubbleBorder, lineWidth: 1)
+                                )
                         }
                     }
                 }
@@ -844,16 +838,35 @@ struct UserBubbleView: View {
     }
 }
 
-// MARK: 助手气泡（蓝色，靠左）
+// MARK: 助手气泡（蓝色文字 + 独立工具卡片，靠左）
 
 struct AssistantBubbleView: View {
     let message: ChatMessage
 
-    /// 是否还没有真实内容（仅初始占位）
+    /// 是否仅有初始空占位（流式开始前）
     private var isStreamingPlaceholder: Bool {
         guard message.blocks.count == 1,
               case .text(let t) = message.blocks[0] else { return false }
         return t.isEmpty
+    }
+
+    /// 是否有非空文本或思考内容
+    private var hasTextContent: Bool {
+        message.blocks.contains {
+            switch $0 {
+            case .text(let t): return !t.isEmpty
+            case .thinking:    return true
+            case .toolCall:    return false
+            }
+        }
+    }
+
+    /// 工具调用列表（单独渲染，不混入文字气泡）
+    private var toolCalls: [ToolCallBlock] {
+        message.blocks.compactMap {
+            if case .toolCall(let tc) = $0 { return tc }
+            return nil
+        }
     }
 
     var body: some View {
@@ -869,40 +882,49 @@ struct AssistantBubbleView: View {
                 )
                 .padding(.top, 3)
 
-            // 气泡内容
-            Group {
-                if isStreamingPlaceholder {
-                    // 加载动画
+            VStack(alignment: .leading, spacing: 8) {
+                // ① 文字 / 思考气泡（蓝色）
+                if isStreamingPlaceholder && toolCalls.isEmpty {
+                    // 初始加载动画
                     StreamingDotsView()
                         .padding(.horizontal, 18).padding(.vertical, 14)
-                } else {
+                        .background(assistBubbleFill)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                        .overlay(RoundedRectangle(cornerRadius: 16)
+                            .stroke(assistBubbleBorder, lineWidth: 1))
+                } else if hasTextContent {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(Array(message.blocks.enumerated()), id: \.offset) { _, block in
-                            switch block {
-                            case .text(let t):
-                                if !t.isEmpty {
-                                    MarkdownText(text: t)
-                                        .font(.system(size: 13))
-                                        .lineSpacing(3.5)
-                                        .textSelection(.enabled)
+                            Group {
+                                switch block {
+                                case .text(let t):
+                                    if !t.isEmpty {
+                                        MarkdownText(text: t)
+                                            .font(.system(size: 13))
+                                            .lineSpacing(3.5)
+                                            .textSelection(.enabled)
+                                    }
+                                case .thinking(let t):
+                                    ThinkingBlockView(text: t)
+                                case .toolCall:
+                                    EmptyView()
                                 }
-                            case .toolCall(let tc):
-                                ToolCallView(tool: tc)
-                            case .thinking(let t):
-                                ThinkingBlockView(text: t)
                             }
                         }
                     }
                     .padding(.horizontal, 14).padding(.vertical, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(assistBubbleFill)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16)
+                        .stroke(assistBubbleBorder, lineWidth: 1))
+                }
+
+                // ② 工具执行卡片（代码/操作数据流，独立于文字气泡）
+                ForEach(toolCalls) { tc in
+                    ToolExecutionCard(tool: tc)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(assistBubbleFill)
-            .clipShape(RoundedRectangle(cornerRadius: 16))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(assistBubbleBorder, lineWidth: 1)
-            )
 
             Spacer(minLength: 52)
         }
@@ -910,88 +932,136 @@ struct AssistantBubbleView: View {
     }
 }
 
-// MARK: - 工具调用视图
+// MARK: - 工具执行卡片（代码/操作数据流）
 
-struct ToolCallView: View {
+struct ToolExecutionCard: View {
     let tool: ToolCallBlock
     @State private var expanded = false
 
-    var icon: String {
-        switch tool.toolName.lowercased() {
-        case "grep":  return "magnifyingglass"
-        case "read":  return "doc.text"
-        case "edit", "write":  return "pencil.and.outline"
-        case "bash", "shell": return "terminal"
-        case "glob":  return "folder.badge.questionmark"
-        default:      return "wrench.and.screwdriver"
-        }
+    var isRunning: Bool { tool.result == nil }
+
+    /// 运行中：琥珀色；完成：绿色
+    var cardBorder: LinearGradient {
+        isRunning
+            ? LinearGradient(
+                colors: [Color(red: 0.95, green: 0.65, blue: 0.10).opacity(0.85),
+                         Color(red: 0.85, green: 0.48, blue: 0.00).opacity(0.55)],
+                startPoint: .topLeading, endPoint: .bottomTrailing)
+            : LinearGradient(
+                colors: [Color(red: 0.28, green: 0.82, blue: 0.46).opacity(0.75),
+                         Color(red: 0.14, green: 0.64, blue: 0.34).opacity(0.48)],
+                startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
-    var accentColor: Color {
+    var cardFill: Color {
+        isRunning
+            ? Color(red: 0.95, green: 0.60, blue: 0.10).opacity(0.04)
+            : Color(red: 0.18, green: 0.78, blue: 0.38).opacity(0.04)
+    }
+
+    var toolIcon: String {
         switch tool.toolName.lowercased() {
-        case "edit", "write":  return .orange
-        case "bash", "shell":  return .green
-        case "grep":           return .blue
-        case "read":           return .cyan
-        default:               return .secondary
+        case "read":                   return "doc.text"
+        case "write":                  return "square.and.pencil"
+        case "edit", "multiedit":      return "pencil.and.outline"
+        case "bash":                   return "terminal"
+        case "grep", "search":         return "magnifyingglass"
+        case "glob":                   return "folder"
+        case "webfetch", "websearch":  return "globe"
+        case "todoread", "todowrite":  return "checklist"
+        case "task":                   return "cpu"
+        default:                       return "wrench.and.screwdriver"
         }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: { withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() } }) {
-                HStack(spacing: 7) {
-                    Image(systemName: icon)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(accentColor)
-                        .frame(width: 14)
-                    Text(tool.toolName)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.primary.opacity(0.75))
-                    Text(tool.args)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    if tool.result != nil {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundColor(.green.opacity(0.8))
+            // 头部行
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+            }) {
+                HStack(spacing: 8) {
+                    // 状态：进度 or 完成对勾
+                    if isRunning {
+                        ProgressView()
+                            .scaleEffect(0.52)
+                            .frame(width: 16, height: 16)
                     } else {
-                        ProgressView().scaleEffect(0.5)
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundColor(Color(red: 0.26, green: 0.76, blue: 0.42))
                     }
+
+                    // 工具图标
+                    Image(systemName: toolIcon)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.secondary.opacity(0.65))
+                        .frame(width: 14)
+
+                    // 工具名（等宽，醒目）
+                    Text(tool.toolName)
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.primary.opacity(0.82))
+
+                    // 参数预览
+                    if !tool.args.isEmpty {
+                        Text(tool.args)
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundColor(.secondary.opacity(0.60))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer()
+
                     Image(systemName: expanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 9))
-                        .foregroundColor(.secondary.opacity(0.55))
+                        .foregroundColor(.secondary.opacity(0.35))
                 }
-                .padding(.horizontal, 10).padding(.vertical, 7)
+                .padding(.horizontal, 12).padding(.vertical, 9)
             }
             .buttonStyle(.plain)
 
+            // 展开详情
             if expanded {
-                Divider().opacity(0.15).padding(.horizontal, 10)
-                VStack(alignment: .leading, spacing: 4) {
+                Divider().opacity(0.10).padding(.horizontal, 12)
+                VStack(alignment: .leading, spacing: 8) {
                     if !tool.args.isEmpty {
-                        Text("参数").font(.system(size: 9, weight: .semibold)).foregroundColor(.secondary.opacity(0.6))
-                        Text(tool.args)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("INPUT")
+                                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.secondary.opacity(0.42))
+                            Text(tool.args)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.primary.opacity(0.78))
+                                .textSelection(.enabled)
+                        }
                     }
                     if let result = tool.result {
-                        Text("结果").font(.system(size: 9, weight: .semibold)).foregroundColor(.secondary.opacity(0.6)).padding(.top, 4)
-                        Text(result)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("OUTPUT")
+                                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                .foregroundColor(.secondary.opacity(0.42))
+                            let preview = result.count > 700
+                                ? String(result.prefix(700)) + "\n…（已截断，共 \(result.count) 字）"
+                                : result
+                            Text(preview)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.secondary.opacity(0.82))
+                                .textSelection(.enabled)
+                        }
                     }
                 }
-                .padding(.horizontal, 10).padding(.vertical, 7)
+                .padding(.horizontal, 12).padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .background(Color.white.opacity(0.05))
-        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.white.opacity(0.08), lineWidth: 1))
-        .cornerRadius(7)
+        .background(cardFill)
+        .clipShape(RoundedRectangle(cornerRadius: 11))
+        .overlay(
+            RoundedRectangle(cornerRadius: 11)
+                .stroke(cardBorder, lineWidth: 1)
+        )
     }
 }
 
