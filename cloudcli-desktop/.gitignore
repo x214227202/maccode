@@ -1,0 +1,8 @@
+node_modules/
+dist-electron/
+webapp/dist/
+webapp/node_modules/
+opengl32.dll
+*.dmg
+*.zip
+*.blockmap

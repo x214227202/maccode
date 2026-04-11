@@ -1,0 +1,93 @@
+{
+  "name": "claude-code-ui-desktop",
+  "version": "1.0.0",
+  "description": "Claude Code UI — 本地桌面版 (Electron)",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron .",
+    "webapp:install": "cd webapp && npm install",
+    "webapp:rebuild": "electron-rebuild -f -w bcrypt,better-sqlite3,node-pty,sqlite3 --electron-version 33.4.11",
+    "webapp:build": "cd webapp && npm run build",
+    "dev": "concurrently \"npm run webapp:dev\" \"wait-on http://127.0.0.1:3001/health && electron .\"",
+    "webapp:dev": "cd webapp && npm run dev",
+    "electron": "electron .",
+    "dist:mac": "npm run webapp:build && npx electron-builder --mac --publish never",
+    "dist:win": "npm run webapp:build && npx electron-builder --win --publish never",
+    "dist:all": "npm run webapp:build && npx electron-builder --mac --win --publish never"
+  },
+  "build": {
+    "appId": "com.claudecodeui.desktop",
+    "productName": "Claude Code UI",
+    "npmRebuild": false,
+    "asar": false,
+    "directories": {
+      "output": "dist-electron"
+    },
+    "extraResources": [
+      {
+        "from": "webapp",
+        "to": "webapp",
+        "filter": [
+          "**/*",
+          "!package.json",
+          "!**/.git/**",
+          "!**/src/**",
+          "!**/*.md",
+          "!**/docker/**",
+          "!**/scripts/**",
+          "!**/node_modules/.bin/**"
+        ]
+      },
+      {
+        "from": "app-package-stub.json",
+        "to": "webapp/package.json"
+      }
+    ],
+    "files": [
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "identity": null,
+      "target": [
+        { "target": "dmg", "arch": ["arm64"] }
+      ],
+      "icon": "build/icon.icns"
+    },
+    "win": {
+      "target": [
+        { "target": "zip", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.ico",
+      "extraFiles": [
+        {
+          "from": "opengl32.dll",
+          "to": "opengl32.dll"
+        }
+      ]
+    },
+    "dmg": {
+      "title": "Claude Code UI 安装",
+      "contents": [
+        { "x": 130, "y": 220 },
+        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "keywords": [],
+  "author": "",
+  "license": "AGPL-3.0-or-later",
+  "devDependencies": {
+    "@electron/rebuild": "3.7.2",
+    "concurrently": "^9.1.2",
+    "electron": "33.4.11",
+    "electron-builder": "^25.1.8",
+    "wait-on": "^8.0.3"
+  }
+}
