@@ -2,8 +2,27 @@ const { app, BrowserWindow, shell, dialog, utilityProcess } = require('electron'
 const path = require('path')
 const net = require('net')
 const http = require('http')
+const { execSync } = require('child_process')
 
 const isDev = !app.isPackaged
+
+// 从用户 login shell 读取完整 PATH（包含 nvm/homebrew/pyenv 等）
+// 打包后的 Electron 进程 PATH 极度精简，spawn 子命令会找不到 node/claude
+function getShellPath() {
+  try {
+    const shell = process.env.SHELL || '/bin/zsh'
+    const p = execSync(`${shell} -l -c 'echo $PATH'`, { timeout: 3000 }).toString().trim()
+    return p || process.env.PATH || ''
+  } catch {
+    // fallback：手动拼接常见路径
+    const extras = [
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+      `${process.env.HOME}/.nvm/versions/node/current/bin`,
+    ]
+    return [...extras, process.env.PATH || ''].join(':')
+  }
+}
 
 // 找一个可用端口
 function findFreePort(start = 3001) {
@@ -52,6 +71,7 @@ async function startServer(port) {
   serverProcess = utilityProcess.fork(serverEntry, [], {
     env: {
       ...process.env,
+      PATH: getShellPath(),
       SERVER_PORT: String(port),
       HOST: '127.0.0.1',
       NODE_ENV: 'production',
